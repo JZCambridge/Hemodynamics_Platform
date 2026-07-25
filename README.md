@@ -1,106 +1,224 @@
 # Hemodynamics Platform
 
-The cornerstone of the main author's doctoral work was the introduction of 'mechanomics' into coronary CFD analysis. By integrating this novel concept and coronary computed tomography angiography (CCTA)-derived radiomic and morphological information, this Python-Qt based interface was developed to automate high-throughput feature extraction. This innovation drastically reduced analysis time from two months to a mere four hours per case. 
+Hemodynamics Platform is a Python desktop application for medical-image processing, vascular geometry and mesh preparation, CFD/FSI workflow management, results extraction, and VTK/PyVista visualization. The interface uses PySide2 (Qt 5) and is started from `GUI_V0/HemodynamicsPlatform.py`.
 
-Picture added later
+Some modules call external software or executables that are not installed by the Python environment. The main interface can run without them, but the corresponding workflows require those tools to be installed and configured separately.
 
-## Citation
+## Windows installation with Conda (recommended)
 
-## Getting Started
-Jay First Correct 
+The project is a legacy Python 3.7 application. Use the pinned versions below; do not replace Python 3.7 with a newer version unless the source code and dependencies are upgraded together.
 
-These instructions will get you a copy of the project up and running on your local machine for development and testing purposes. See deployment for notes on how to deploy the project on a live system.
+### 1. Install Conda
 
-### Prerequisites
+Install a 64-bit Windows version of [Miniconda or Anaconda](https://docs.conda.io/projects/conda/en/stable/user-guide/install/windows.html). During installation, the default options are suitable for most users.
 
-For Python + Conda + Windows environment set up:
+After installation, open **Anaconda Prompt** from the Windows Start menu. Use Anaconda Prompt for every command in this guide; a normal Command Prompt may not recognize `conda` until Conda has been initialized.
 
-Win + R type 'cmd' open terminal
-```bash
-activate
-conda env create -f environment.yml
+### 2. Open the project directory
+
+Replace the example path with the folder in which you downloaded or cloned this repository:
+
+```bat
+cd /d "C:\Users\YOUR_NAME\Documents\HemodynamicsPlatform"
 ```
 
-linux + docker
-docker build -t hymoplatform .
+Confirm that you are in the correct directory:
 
-On Linux hosts, first run:
+```bat
+dir env\environment.yml
+dir GUI_V0\HemodynamicsPlatform.py
+```
+
+Both commands should display a file. If either says `File Not Found`, correct the project path before continuing.
+
+### 3. Create and activate the environment
+
+```bat
+conda env create --file env\environment.yml
+conda activate VTK_Side37
+```
+
+The first command downloads several hundred megabytes and may take a while. If Conda displays `Proceed ([y]/n)?`, type `y` and press Enter. A successful activation changes the beginning of the prompt to `(VTK_Side37)`.
+
+Check that the correct Python is active:
+
+```bat
+where python
+python --version
+```
+
+`python --version` must report `Python 3.7.16`, and the first path printed by `where python` should contain `VTK_Side37`.
+
+### 4. Verify the important imports
+
+Copy this command as one line:
+
+```bat
+python -c "import PySide2, vtk, pyvista, pyvistaqt, SimpleITK, cv2, numpy, scipy, skimage, sklearn, pandas, meshio, yaml, radiomics, openpyxl, networkx; print('Environment check passed')"
+```
+
+Continue only after it prints `Environment check passed` without an exception.
+
+### 5. Start the interface
+
+```bat
+cd GUI_V0
+python HemodynamicsPlatform.py
+```
+
+Keep Anaconda Prompt open while using the application. On later runs, repeat only these commands from the repository root:
+
+```bat
+conda activate VTK_Side37
+cd GUI_V0
+python HemodynamicsPlatform.py
+```
+
+## Manual Windows installation if the YAML command fails
+
+Use this fallback only if `conda env create --file env\environment.yml` fails. It follows the package sequence in `env/EnviromentSet.txt`, with versions pinned so that pip does not select packages that have dropped Python 3.7 support.
+
+First remove an incomplete environment, if one was created:
+
+```bat
+conda deactivate
+conda env remove --name VTK_Side37
+```
+
+If Conda reports that the environment does not exist, continue. Create a clean environment and activate it:
+
+```bat
+conda create --name VTK_Side37 python=3.7.16 pip=22.3.1 setuptools=65.6.3 wheel=0.38.4
+conda activate VTK_Side37
+```
+
+If Conda asks whether to proceed, type `y` and press Enter.
+
+Install the packages into the active environment. Run every command and stop if a command reports an error:
+
+```bat
+python -m pip install psutil==5.9.4
+python -m pip install PySide2==5.15.2.1 shiboken2==5.15.2.1
+python -m pip install numpy==1.21.6
+python -m pip install SimpleITK==2.0.2
+python -m pip install matplotlib==3.4.0
+python -m pip install opencv-python==4.5.4.60
+python -m pip install scipy==1.7.3
+python -m pip install scikit-image==0.19.3
+python -m pip install vtk==9.2.6
+python -m pip install scikit-learn==1.0.2
+python -m pip install pandas==1.3.5
+python -m pip install more-itertools==9.1.0
+python -m pip install meshio==5.3.4
+python -m pip install PyYAML==6.0
+python -m pip install pyradiomics==3.0.1
+python -m pip install pyvista==0.38.3
+python -m pip install pyvistaqt==0.9.1
+python -m pip install pyinstaller==5.8.0
+python -m pip install openpyxl==3.1.1
+python -m pip install networkx==2.6.3
+```
+
+Then perform the import check and start the interface as described above.
+
+## Windows troubleshooting
+
+### Qt reports that the `windows` platform plugin cannot be loaded
+
+Do not install PyQt5; this application uses PySide2. With `VTK_Side37` activated, first point Qt to the plugin directory bundled with PySide2:
+
+```bat
+set "QT_QPA_PLATFORM_PLUGIN_PATH=%CONDA_PREFIX%\Lib\site-packages\PySide2\plugins\platforms"
+cd GUI_V0
+python HemodynamicsPlatform.py
+```
+
+The setting lasts only for the current Anaconda Prompt. If that command fixes the problem and you want the tested file-copy workaround from `env/EnviromentSet.txt`, run:
+
+```bat
+xcopy /E /I /Y "%CONDA_PREFIX%\Lib\site-packages\PySide2\plugins\platforms" "%CONDA_PREFIX%\Library\plugins\platforms"
+```
+
+`%CONDA_PREFIX%` is filled in by Conda, so these commands work regardless of where Anaconda or Miniconda is installed.
+
+### The window is blank or VTK/OpenGL fails
+
+Force Qt to use software OpenGL for the current prompt, then start the application again:
+
+```bat
+set QT_OPENGL=software
+python HemodynamicsPlatform.py
+```
+
+Also update the graphics driver supplied by the computer or GPU manufacturer.
+
+### `conda` is not recognized
+
+Close the terminal and open **Anaconda Prompt**. If Anaconda Prompt is not present, repair or reinstall Miniconda/Anaconda for the current Windows user.
+
+### A package is missing after installation
+
+Check the active environment before installing anything else:
+
+```bat
+conda activate VTK_Side37
+where python
+python --version
+```
+
+Do not use `pip install --user`, because that installs packages outside the Conda environment. Recreate the environment using the steps above if it is incomplete.
+
+### The environment already exists
+
+If an earlier installation stopped partway through, recreate it cleanly:
+
+```bat
+conda deactivate
+conda env remove --name VTK_Side37
+conda env create --file env\environment.yml
+```
+
+## Docker on a Linux desktop (optional)
+
+The Docker image is intended for a Linux host with an X11 desktop. Windows users should use the Conda instructions above. The image uses software OpenGL, so an NVIDIA GPU is not required.
+
+From the repository root, build the image:
+
+```bash
+docker build --file env/Dockerfile --tag hemodynamics-platform .
+```
+
+Confirm that the Linux host has a display (`echo "$DISPLAY"` should not be empty), temporarily allow the container to connect to X11, and start the GUI:
+
+```bash
 xhost +local:docker
 
-docker run -it --rm --gpus all -v /tmp/.X11-unix:/tmp/.X11-unix -e DISPLAY=$DISPLAY -v $HOME/.Xauthority:/root/.Xauthority --device=/dev/dri:/dev/dri --ipc=host -v $(pwd):/app hymohlatform
+docker run --rm --interactive --tty \
+  --entrypoint /bin/bash \
+  --env DISPLAY="$DISPLAY" \
+  --env QT_X11_NO_MITSHM=1 \
+  --volume /tmp/.X11-unix:/tmp/.X11-unix:rw \
+  --volume "$PWD":/app \
+  --workdir /app/GUI_V0 \
+  hemodynamics-platform \
+  -lc "python HemodynamicsPlatform.py"
 
-docker run -it --rm --gpus 1 --shm-size 16G -v /tmp/.X11-unix:/tmp/.X11-unix -v ~/ukb:/ukb -v ~/cardiac:/cardiac -v ~/temp:/temp -v ~/jzheng12:/jzheng12 -e DISPLAY=$DISPLAY -v $HOME/.Xauthority:/root/.Xauthority --device=/dev/dri:/dev/dri --ipc=host -v $(pwd):/app hymohlatform
+xhost -local:docker
+```
 
+The `--entrypoint` override is intentional: the image's default entrypoint starts a virtual framebuffer for headless use, whereas the command above connects the application to the host display. The final `xhost` command removes the temporary X11 permission.
 
+To make host data available inside the container, add a mount and select those paths in the application, for example:
 
+```bash
+--volume "/path/on/host:/data"
+```
 
-### Installing
+## Repository layout
 
-A step by step series of examples that tell you how to get a development environment running:
-
-Say what the step will be:
-
-\```bash
-Give the example
-\```
-
-And repeat:
-
-\```bash
-until finished
-\```
-
-End with an example of getting some data out of the system or using it for a little demo.
-
-## Running the tests
-
-Explain how to run the automated tests for this system.
-
-### Break down into end-to-end tests
-
-Explain what these tests test and why:
-
-\```bash
-Give an example
-\```
-
-### And coding style tests
-
-Explain what these tests test and why:
-
-\```bash
-Give an example
-\```
-
-## Deployment
-
-Add additional notes about how to deploy this on a live system.
-
-## Built With
-
-* [PyQt5](https://riverbankcomputing.com/software/pyqt/intro) - The GUI framework used
-* [Python](https://www.python.org/) - Programming Language
-
-## Contributing
-
-Please read [CONTRIBUTING.md](https://gist.github.com/PurpleBooth/b24679402957c63ec426) for details on our code of conduct, and the process for submitting pull requests to us.
-
-## Versioning
-
-We use [SemVer](http://semver.org/) for versioning. For the versions available, see the [tags on this repository](https://github.com/your/project/tags).
-
-## Authors
-
-* **Your Name** - *Initial work* - [YourGithubUsername](https://github.com/YourGithubUsername)
-
-See also the list of [contributors](https://github.com/your/project/contributors) who participated in this project.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details
-
-## Acknowledgments
-
-* Hat tip to anyone whose code was used
-* Inspiration
-* etc
+- `GUI_V0/` — main application, modules, and Qt `.ui` files.
+- `Functions_AZ/`, `Functions_JZ/`, and `Functions_YC/` — shared processing functions.
+- `Base/` — styles and supporting resources.
+- `env/environment.yml` — reproducible Conda environment for the legacy application.
+- `env/EnviromentSet.txt` — original tested Windows installation notes.
+- `env/Dockerfile` — optional Linux container environment.

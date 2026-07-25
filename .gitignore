@@ -24,3 +24,6 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
+
+# ignore temp folder
+temp/
