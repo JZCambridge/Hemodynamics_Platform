@@ -23,6 +23,7 @@ sys.path.insert(0, '../QSSFil/QSS_IMG')
 ##############################################################################
 # Import functions self-written
 from Modules_JZ.FilterMask import FilterMaskMain
+from Modules_JZ.BatchNIIDataPrepare import BatchNIIDataPrepareMain
 from Modules_YC.Centerline_Extraction import Centerline_ExtractionMain
 from Modules_JZ.CenterlineXsection import CenterlineXsectionMain
 from Modules_AZ.TissueElemAssign import TissueElemAssignMain
@@ -193,6 +194,12 @@ class GUIMain:
         self.ui.QStackedWidget_Module.addWidget(self.BatchPreProcessingui.centralwidget)
         self.BatchPreproc = BatchCoronaryMain.BatchCoronary(UI=self.BatchPreProcessingui, Hedys=self)
 
+        BatchNIIDataPrepareuiPath = re.sub('main.ui', 'BatchNIIDataPrepare.ui', uiPath)
+        self.BatchNIIDataPrepareui = QUiLoader().load(BatchNIIDataPrepareuiPath)
+        self.ui.QStackedWidget_Module.addWidget(self.BatchNIIDataPrepareui.centralwidget)
+        self.BatchNIIDataPrepare = BatchNIIDataPrepareMain.BatchNIIDataPrepare(
+            UI=self.BatchNIIDataPrepareui, Hedys=self)
+
         BatchCoronaryFSIuiPath = re.sub('main.ui', 'BatchCoronaryFSI.ui', uiPath)
         self.BatchCoronaryFSIui = QUiLoader().load(BatchCoronaryFSIuiPath)
         self.ui.QStackedWidget_Module.addWidget(self.BatchCoronaryFSIui.centralwidget)
@@ -355,12 +362,53 @@ class GUIMain:
         self.extractImgInfo = SegmentInfoExtractMain.SegmentInforExtract(
             UI=self.SegmentationInformationExtractionui, Hedys=self)
 
+        self._sort_modules_alphabetically()
+
         # Initialisation of image display
         self.qtVtkInit = InitQTVTKMain.InitQTVTK(self)
         self.ui.InitDispBtn_VTKQT.clicked.connect(lambda: self.qtVtkInit.ShowQTVTK())
 
         # ParaView set up
         self.ui.QComboBox_Modules.currentIndexChanged.connect(lambda: self.VisualizationParaview())
+
+    def _sort_modules_alphabetically(self):
+        """Sort module names and their corresponding pages together."""
+        combo = self.ui.QComboBox_Modules
+        stack = self.ui.QStackedWidget_Module
+
+        if combo.count() != stack.count():
+            raise RuntimeError(
+                "Module selector and page stack must contain the same number of items."
+            )
+
+        current_widget = stack.currentWidget()
+        modules = [
+            (combo.itemText(index), stack.widget(index))
+            for index in range(combo.count())
+        ]
+        modules.sort(key=lambda module: module[0].casefold())
+
+        combo_signals_blocked = combo.blockSignals(True)
+        stack_signals_blocked = stack.blockSignals(True)
+        try:
+            combo.clear()
+            for _, widget in modules:
+                stack.removeWidget(widget)
+
+            for label, widget in modules:
+                combo.addItem(label)
+                stack.addWidget(widget)
+
+            current_index = next(
+                index
+                for index, (_, widget) in enumerate(modules)
+                if widget is current_widget
+            )
+            combo.setCurrentIndex(current_index)
+            stack.setCurrentIndex(current_index)
+        finally:
+            combo.blockSignals(combo_signals_blocked)
+            stack.blockSignals(stack_signals_blocked)
 
     def VisualizationParaview(self):
         if self.ui.QComboBox_Modules.currentText() == 'VisualizationParaview':

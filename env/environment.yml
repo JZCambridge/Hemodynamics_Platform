@@ -1,10 +1,10 @@
-name: VTK_Side37
+name: hymo
 channels:
   - defaults
 dependencies:
-  # Keep Conda responsible only for the legacy Python toolchain. Installing the
-  # Qt/VTK stack once, through pip, avoids the mixed Conda/pip Qt conflict in
-  # the previous environment files.
+  # Keep Conda responsible only for the legacy Python toolchain. The pip
+  # packages below follow the tested order in EnviromentSet.txt; versions are
+  # pinned to the Python 3.7-compatible set also used by the Docker image.
   - python=3.7.16
   - pip=22.3.1
   - setuptools=65.6.3

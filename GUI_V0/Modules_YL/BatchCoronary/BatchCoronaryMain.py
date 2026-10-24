@@ -1644,6 +1644,7 @@ class BatchCoronary:
 
         # create overall table directory
         self.TableDir = os.path.join(self.WorkingDir, 'Table')
+        os.makedirs(self.TableDir, exist_ok=True)
 
         # cmd english
         os.system('chcp 437')
@@ -1684,7 +1685,7 @@ class BatchCoronary:
 
         # centerline generation
         if self.CGFlag:
-            self.UpdateMsgLog('Centerline Generation done')
+            self.UpdateMsgLog('Centerline Generation start')
             self.BatchCenterlineGen()
             self.UpdateMsgLog('Centerline Generation done')
 

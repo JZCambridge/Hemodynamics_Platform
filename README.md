@@ -6,7 +6,7 @@ Some modules call external software or executables that are not installed by the
 
 ## Windows installation with Conda (recommended)
 
-The project is a legacy Python 3.7 application. Use the pinned versions below; do not replace Python 3.7 with a newer version unless the source code and dependencies are upgraded together.
+The project is a legacy, CPU-only Python 3.7 application. Use the pinned versions below; do not replace Python 3.7 with a newer version unless the source code and dependencies are upgraded together. CUDA and deep-learning frameworks are not required.
 
 ### 1. Install Conda
 
@@ -35,10 +35,17 @@ Both commands should display a file. If either says `File Not Found`, correct th
 
 ```bat
 conda env create --file env\environment.yml
-conda activate VTK_Side37
+conda activate hymo
 ```
 
-The first command downloads several hundred megabytes and may take a while. If Conda displays `Proceed ([y]/n)?`, type `y` and press Enter. A successful activation changes the beginning of the prompt to `(VTK_Side37)`.
+The first command downloads several hundred megabytes and may take a while. If Conda displays `Proceed ([y]/n)?`, type `y` and press Enter. A successful activation changes the beginning of the prompt to `(hymo)`.
+
+For an exact Windows x64 recreation of the environment that passed the import and GUI smoke tests, use the lock file instead of the readable environment file:
+
+```bat
+conda env create --file env\environment-win-64.lock.yml
+conda activate hymo
+```
 
 Check that the correct Python is active:
 
@@ -47,7 +54,7 @@ where python
 python --version
 ```
 
-`python --version` must report `Python 3.7.16`, and the first path printed by `where python` should contain `VTK_Side37`.
+`python --version` must report `Python 3.7.16`, and the first path printed by `where python` should contain `hymo`.
 
 ### 4. Verify the important imports
 
@@ -69,27 +76,27 @@ python HemodynamicsPlatform.py
 Keep Anaconda Prompt open while using the application. On later runs, repeat only these commands from the repository root:
 
 ```bat
-conda activate VTK_Side37
+conda activate hymo
 cd GUI_V0
 python HemodynamicsPlatform.py
 ```
 
 ## Manual Windows installation if the YAML command fails
 
-Use this fallback only if `conda env create --file env\environment.yml` fails. It follows the package sequence in `env/EnviromentSet.txt`, with versions pinned so that pip does not select packages that have dropped Python 3.7 support.
+The YAML contains the same real packages and order as `env/EnviromentSet.txt`, with Python 3.7-compatible versions taken from the Docker configuration. Conda installs its `pip:` section in one transaction, as the Dockerfile does. Use the commands below only if that transaction fails or if the historical one-command-at-a-time installation is required. They preserve the original sequence while pinning versions so that pip does not select packages that have dropped Python 3.7 support.
 
 First remove an incomplete environment, if one was created:
 
 ```bat
 conda deactivate
-conda env remove --name VTK_Side37
+conda env remove --name hymo
 ```
 
 If Conda reports that the environment does not exist, continue. Create a clean environment and activate it:
 
 ```bat
-conda create --name VTK_Side37 python=3.7.16 pip=22.3.1 setuptools=65.6.3 wheel=0.38.4
-conda activate VTK_Side37
+conda create --name hymo python=3.7.16 pip=22.3.1 setuptools=65.6.3 wheel=0.38.4
+conda activate hymo
 ```
 
 If Conda asks whether to proceed, type `y` and press Enter.
@@ -125,7 +132,7 @@ Then perform the import check and start the interface as described above.
 
 ### Qt reports that the `windows` platform plugin cannot be loaded
 
-Do not install PyQt5; this application uses PySide2. With `VTK_Side37` activated, first point Qt to the plugin directory bundled with PySide2:
+Do not install PyQt5; this application uses PySide2. With `hymo` activated, first point Qt to the plugin directory bundled with PySide2:
 
 ```bat
 set "QT_QPA_PLATFORM_PLUGIN_PATH=%CONDA_PREFIX%\Lib\site-packages\PySide2\plugins\platforms"
@@ -161,7 +168,7 @@ Close the terminal and open **Anaconda Prompt**. If Anaconda Prompt is not prese
 Check the active environment before installing anything else:
 
 ```bat
-conda activate VTK_Side37
+conda activate hymo
 where python
 python --version
 ```
@@ -174,7 +181,7 @@ If an earlier installation stopped partway through, recreate it cleanly:
 
 ```bat
 conda deactivate
-conda env remove --name VTK_Side37
+conda env remove --name hymo
 conda env create --file env\environment.yml
 ```
 
@@ -220,5 +227,6 @@ To make host data available inside the container, add a mount and select those p
 - `Functions_AZ/`, `Functions_JZ/`, and `Functions_YC/` — shared processing functions.
 - `Base/` — styles and supporting resources.
 - `env/environment.yml` — reproducible Conda environment for the legacy application.
+- `env/environment-win-64.lock.yml` — exact resolved Windows x64 environment that passed the GUI smoke test.
 - `env/EnviromentSet.txt` — original tested Windows installation notes.
 - `env/Dockerfile` — optional Linux container environment.

@@ -1,0 +1,2 @@
+"""Batch NIfTI preparation module."""
+
