@@ -2646,7 +2646,10 @@ class BatchCoronary:
 
                     tempCaseColumn2 = [interpolation_xsmsk,
                                        outputCSV_xsmsk,
-                                       branch['original_branch'] + 'Val.nii.gz',
+                                       os.path.join(
+                                           'Branches',
+                                           branch['original_branch'] + 'Val.nii.gz'
+                                       ),
                                        branch['original_csv'],
                                        branch['cross_section_mask_NN'], branch['3D_csv']]
                     tempCaseTable.append(tempCaseColumn2)
@@ -2669,9 +2672,15 @@ class BatchCoronary:
                                     '169', 'Yes', 'Yes', 'X', 'No', '0', '0', '0', '66', '169']
                     self.XsectionFixExtTable.append(tmpExtColumn)
 
-                    tmpOriColumn = [self.XsectionFixExtPathList[loopIndex],
-                                    'CTA.nii.gz',
-                                    branch['cross_section_mask_fix_extension'],
+                    preproc_path = os.path.dirname(
+                        self.OriDataPathList[loopIndex]
+                    )
+                    tmpOriColumn = [preproc_path,
+                                    os.path.join('OriData', 'CTA.nii.gz'),
+                                    os.path.join(
+                                        'XsectionFixExt',
+                                        branch['cross_section_mask_fix_extension']
+                                    ),
                                     os.path.join(self.XsectionPathList[loopIndex], branch['3D_csv']),
                                     fillDistance,
                                     processors,
@@ -2700,7 +2709,9 @@ class BatchCoronary:
                     AVCBranMTable.append(tmpAVCBranchMCol)
 
                     # insert columns into OriVolume fix table
-                    OriVCTAPath = os.path.join(self.OriVolumePathList[loopIndex], "CTA.nii.gz")
+                    OriVCTAPath = os.path.join(
+                        self.OriDataPathList[loopIndex], "CTA.nii.gz"
+                    )
                     OriVMaskPath = os.path.join(self.OriVolumePathList[loopIndex], branch['original_volume_mask_fix'])
                     tmpOriVFixColumn = [OriVCTAPath,
                                         OriVMaskPath,
@@ -2721,7 +2732,7 @@ class BatchCoronary:
             _write_dataframe_atomic(case_df, caseFilePath)
 
             # add record to overall Xsection table
-            self.XsectionTable.append([self.BranchPathList[loopIndex], CSVPath, self.XsectionPathList[loopIndex],
+            self.XsectionTable.append([self.OriDataPathList[loopIndex], CSVPath, self.XsectionPathList[loopIndex],
                                        self.XsectionPathList[loopIndex], resampleDepth, CPRAngle, cpus,
                                        caseFilePath, self.CPREXEPath])
 

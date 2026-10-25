@@ -13,9 +13,12 @@ if str(MODULE_DIRECTORY) not in sys.path:
 
 from BatchNIIDataPrepareMain import (  # noqa: E402
     CANONICAL_CTA_RELATIVE_PATH,
+    CTA_DESTINATION_RELATIVE_PATHS,
+    DEFAULT_CTA_DESTINATIONS,
     MANIFEST_FILE_NAME,
     OUTPUT_FOLDER_NAME,
     PIPELINE_CTA_RELATIVE_PATHS,
+    XSECTION_STATUS_FIELDS,
     build_case_plan,
     prepare_batch_data,
     sanitize_case_id,
@@ -48,6 +51,145 @@ def write_source(folder, name, content):
 
 
 class BatchNIIDataPrepareTests(unittest.TestCase):
+    def test_explicit_ori_data_only_selection_creates_one_verified_cta(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            input_path = temporary_path / "input"
+            output_path = temporary_path / "output"
+            input_path.mkdir()
+            source = write_source(
+                input_path,
+                "CASE_001.nii.gz",
+                b"single-authoritative-cta" * 100,
+            )
+
+            result = prepare_batch_data(
+                input_path,
+                output_path,
+                create_pipeline_folders=True,
+                batch_preproc=StubBatchPreproc(),
+                cta_destinations=DEFAULT_CTA_DESTINATIONS,
+            )
+
+            case_path = (
+                output_path / OUTPUT_FOLDER_NAME / "batch_0" / "CASE_001"
+            )
+            destination_paths = {
+                key: case_path / relative_path
+                for key, relative_path in CTA_DESTINATION_RELATIVE_PATHS
+            }
+            self.assertEqual(result.cta_destinations, ("ori_data",))
+            self.assertTrue(result.pipeline_ready)
+            self.assertEqual(result.copied_file_count, 1)
+            self.assertTrue(destination_paths["ori_data"].is_file())
+            self.assertEqual(
+                sha256_file(destination_paths["ori_data"]),
+                sha256_file(source),
+            )
+            self.assertTrue(all(
+                not path.exists()
+                for key, path in destination_paths.items()
+                if key != "ori_data"
+            ))
+
+            with result.manifest_path.open(
+                    "r", encoding="utf-8", newline="") as csv_file:
+                row = next(csv.DictReader(csv_file))
+            self.assertEqual(row["canonical_cta_path"], "")
+            self.assertEqual(row["canonical_cta_sha256"], "")
+            self.assertEqual(row["canonical_verified"], "False")
+            self.assertEqual(
+                Path(row["ori_data_cta_path"]).resolve(),
+                destination_paths["ori_data"].resolve(),
+            )
+            self.assertEqual(row["ori_data_cta_sha256"], sha256_file(source))
+            self.assertEqual(row["pipeline_copies_requested"], "True")
+            self.assertEqual(row["pipeline_copies_verified"], "True")
+            self.assertEqual(row["all_verified"], "True")
+
+    def test_every_explicit_cta_destination_can_be_selected_individually(self):
+        for destination_key, relative_path in CTA_DESTINATION_RELATIVE_PATHS:
+            with self.subTest(destination=destination_key), tempfile.TemporaryDirectory() as temporary_directory:
+                temporary_path = Path(temporary_directory)
+                input_path = temporary_path / "input"
+                output_path = temporary_path / "output"
+                input_path.mkdir()
+                source = write_source(input_path, "CASE_001.nii.gz", b"source")
+
+                result = prepare_batch_data(
+                    input_path,
+                    output_path,
+                    create_pipeline_folders=False,
+                    cta_destinations=destination_key,
+                )
+
+                case_path = (
+                    output_path / OUTPUT_FOLDER_NAME / "batch_0" / "CASE_001"
+                )
+                self.assertEqual(result.cta_destinations, (destination_key,))
+                self.assertEqual(
+                    sha256_file(case_path / relative_path),
+                    sha256_file(source),
+                )
+                self.assertEqual(
+                    [
+                        key
+                        for key, candidate in CTA_DESTINATION_RELATIVE_PATHS
+                        if (case_path / candidate).is_file()
+                    ],
+                    [destination_key],
+                )
+
+    def test_invalid_cta_destinations_are_rejected_before_output_creation(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            input_path = temporary_path / "input"
+            input_path.mkdir()
+            write_source(input_path, "CASE_001.nii.gz", b"source")
+
+            for selection, message in (((), "at least one"), (("unknown",), "Unknown")):
+                output_path = temporary_path / ("output_" + (message.lower().replace(" ", "_")))
+                with self.subTest(selection=selection), self.assertRaisesRegex(
+                        ValueError, message):
+                    prepare_batch_data(
+                        input_path,
+                        output_path,
+                        create_pipeline_folders=False,
+                        cta_destinations=selection,
+                    )
+                self.assertFalse(output_path.exists())
+
+    def test_unselected_existing_cta_is_preserved_and_reported_on_rerun(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            input_path = temporary_path / "input"
+            output_path = temporary_path / "output"
+            input_path.mkdir()
+            write_source(input_path, "CASE_001.nii.gz", b"source")
+            first_result = prepare_batch_data(
+                input_path,
+                output_path,
+                create_pipeline_folders=False,
+                cta_destinations=("ori_data",),
+            )
+            case_path = first_result.manifest_path.parent / "batch_0" / "CASE_001"
+            legacy_path = case_path / dict(CTA_DESTINATION_RELATIVE_PATHS)["branches"]
+            legacy_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy_path.write_bytes(b"preserve-this-legacy-copy")
+
+            second_result = prepare_batch_data(
+                input_path,
+                output_path,
+                create_pipeline_folders=False,
+                cta_destinations=("ori_data",),
+            )
+
+            self.assertEqual(second_result.copied_file_count, 0)
+            self.assertEqual(second_result.unchanged_file_count, 1)
+            self.assertEqual(second_result.preserved_unselected_file_count, 1)
+            self.assertEqual(legacy_path.read_bytes(), b"preserve-this-legacy-copy")
+            self.assertIn("preserved 1", second_result.summary())
+
     def test_blank_paths_and_empty_inputs_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_path = Path(temporary_directory)
@@ -550,6 +692,34 @@ class BatchNIIDataPrepareTests(unittest.TestCase):
                 "filter_mask_failed": "0",
                 "filter_mask_er_msg": "",
                 "complete_filter_mask": "0",
+                "run_xsection": "0",
+                "LCx_xsection_CTA_exe_failed": "0",
+                "LCx_xsection_CTA_exe_er_msg": "",
+                "LCx_xsection_CTA_complete": "0",
+                "mLAD_xsection_CTA_exe_failed": "0",
+                "mLAD_xsection_CTA_exe_er_msg": "",
+                "mLAD_xsection_CTA_complete": "0",
+                "mRCA_xsection_CTA_exe_failed": "0",
+                "mRCA_xsection_CTA_exe_er_msg": "",
+                "mRCA_xsection_CTA_complete": "0",
+                "complete_xsection_CTA": "0",
+                "LCx_xsection_seg_exe_failed": "0",
+                "LCx_xsection_seg_exe_er_msg": "",
+                "LCx_xsection_seg_complete": "0",
+                "mLAD_xsection_seg_exe_failed": "0",
+                "mLAD_xsection_seg_exe_er_msg": "",
+                "mLAD_xsection_seg_complete": "0",
+                "mRCA_xsection_seg_exe_failed": "0",
+                "mRCA_xsection_seg_exe_er_msg": "",
+                "mRCA_xsection_seg_complete": "0",
+                "complete_xsection_seg": "0",
+                "LCx_lumen_complete": "0",
+                "LCx_lumen_er_msg": "",
+                "mLAD_lumen_complete": "0",
+                "mLAD_lumen_er_msg": "",
+                "mRCA_lumen_complete": "0",
+                "mRCA_lumen_er_msg": "",
+                "complete_lumen_correction": "0",
             }
             recorded_status = {
                 "run_segmentation": "1",
@@ -565,6 +735,34 @@ class BatchNIIDataPrepareTests(unittest.TestCase):
                 "filter_mask_failed": "0",
                 "filter_mask_er_msg": "",
                 "complete_filter_mask": "1",
+                "run_xsection": "1",
+                "LCx_xsection_CTA_exe_failed": "0",
+                "LCx_xsection_CTA_exe_er_msg": "",
+                "LCx_xsection_CTA_complete": "1",
+                "mLAD_xsection_CTA_exe_failed": "1",
+                "mLAD_xsection_CTA_exe_er_msg": "CTA resampling exited with code 7",
+                "mLAD_xsection_CTA_complete": "0",
+                "mRCA_xsection_CTA_exe_failed": "0",
+                "mRCA_xsection_CTA_exe_er_msg": "",
+                "mRCA_xsection_CTA_complete": "1",
+                "complete_xsection_CTA": "0",
+                "LCx_xsection_seg_exe_failed": "0",
+                "LCx_xsection_seg_exe_er_msg": "",
+                "LCx_xsection_seg_complete": "1",
+                "mLAD_xsection_seg_exe_failed": "0",
+                "mLAD_xsection_seg_exe_er_msg": "",
+                "mLAD_xsection_seg_complete": "1",
+                "mRCA_xsection_seg_exe_failed": "1",
+                "mRCA_xsection_seg_exe_er_msg": "segmentation output missing",
+                "mRCA_xsection_seg_complete": "0",
+                "complete_xsection_seg": "0",
+                "LCx_lumen_complete": "1",
+                "LCx_lumen_er_msg": "",
+                "mLAD_lumen_complete": "0",
+                "mLAD_lumen_er_msg": "corrected lumen is empty",
+                "mRCA_lumen_complete": "1",
+                "mRCA_lumen_er_msg": "",
+                "complete_lumen_correction": "0",
             }
 
             result = prepare_batch_data(
@@ -576,6 +774,11 @@ class BatchNIIDataPrepareTests(unittest.TestCase):
                 reader = csv.DictReader(csv_file)
                 fieldnames = reader.fieldnames
                 rows = list(reader)
+
+            self.assertEqual(
+                tuple(field for field in fieldnames if field in XSECTION_STATUS_FIELDS),
+                XSECTION_STATUS_FIELDS,
+            )
 
             self.assertEqual(
                 {field: rows[0][field] for field in default_status},
@@ -615,7 +818,7 @@ class BatchNIIDataPrepareTests(unittest.TestCase):
                 default_status,
             )
 
-    def test_legacy_manifest_gets_defaults_for_new_downstream_status_fields(self):
+    def test_legacy_manifest_gets_defaults_for_new_processing_status_fields(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_path = Path(temporary_directory)
             input_path = temporary_path / "input"
@@ -643,8 +846,9 @@ class BatchNIIDataPrepareTests(unittest.TestCase):
                 "filter_mask_er_msg",
                 "complete_filter_mask",
             )
+            new_processing_fields = downstream_fields + XSECTION_STATUS_FIELDS
             legacy_fieldnames = [
-                field for field in fieldnames if field not in downstream_fields
+                field for field in fieldnames if field not in new_processing_fields
             ]
             legacy_row = {field: row[field] for field in legacy_fieldnames}
             legacy_row["run_segmentation"] = "1"
@@ -669,7 +873,7 @@ class BatchNIIDataPrepareTests(unittest.TestCase):
             self.assertEqual(upgraded_row["run_segmentation"], "1")
             self.assertEqual(upgraded_row["complete_segmentation"], "1")
             self.assertEqual(
-                {field: upgraded_row[field] for field in downstream_fields},
+                {field: upgraded_row[field] for field in new_processing_fields},
                 {
                     "run_centerline_csv_check": "0",
                     "centerline_csv_failed": "0",
@@ -679,6 +883,10 @@ class BatchNIIDataPrepareTests(unittest.TestCase):
                     "filter_mask_failed": "0",
                     "filter_mask_er_msg": "",
                     "complete_filter_mask": "0",
+                    **{
+                        field: "" if field.endswith("_er_msg") else "0"
+                        for field in XSECTION_STATUS_FIELDS
+                    },
                 },
             )
 

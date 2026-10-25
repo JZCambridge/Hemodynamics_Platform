@@ -25,8 +25,9 @@ except ImportError:  # Core preparation remains usable without Qt.
     QFileDialog = None
 
 
-DEFAULT_INPUT_FOLDER = r"G:\FishAndChips_C2\test_codex\temp_nii"
-DEFAULT_OUTPUT_FOLDER = r"G:\FishAndChips_C2\test_codex"
+DEFAULT_DATA_ROOT = Path(r"S:\04_JZ\FishAndChips_C2")
+DEFAULT_INPUT_FOLDER = str(DEFAULT_DATA_ROOT / "0_Raw_Data")
+DEFAULT_OUTPUT_FOLDER = str(DEFAULT_DATA_ROOT)
 OUTPUT_FOLDER_NAME = "0_Initial_Segmentation"
 MANIFEST_FILE_NAME = "BatchNIIDataPrepare_manifest.csv"
 DEFAULT_CASES_PER_BATCH = 100
@@ -48,6 +49,20 @@ PIPELINE_CTA_RELATIVE_PATHS = (
     ("xsection_fix_ext", Path("Preproc") / "XsectionFixExt" / "CTA.nii.gz"),
     ("ori_volume", Path("Preproc") / "OriVolume" / "CTA.nii.gz"),
 )
+CTA_DESTINATION_RELATIVE_PATHS = (
+    ("canonical", CANONICAL_CTA_RELATIVE_PATH),
+) + PIPELINE_CTA_RELATIVE_PATHS
+CTA_DESTINATION_KEYS = tuple(
+    destination_key for destination_key, _ in CTA_DESTINATION_RELATIVE_PATHS
+)
+DEFAULT_CTA_DESTINATIONS = ("ori_data",)
+CTA_DESTINATION_WIDGET_NAMES = (
+    ("canonical", "CopyCanonicalCTA_CB_BNDP"),
+    ("ori_data", "CopyOriDataCTA_CB_BNDP"),
+    ("branches", "CopyBranchesCTA_CB_BNDP"),
+    ("xsection_fix_ext", "CopyXsectionFixExtCTA_CB_BNDP"),
+    ("ori_volume", "CopyOriVolumeCTA_CB_BNDP"),
+)
 
 SEGMENTATION_FIELDS = (
     "run_segmentation",
@@ -68,7 +83,40 @@ DOWNSTREAM_STATUS_FIELDS = (
     "complete_filter_mask",
 )
 
-PROCESSING_STATUS_FIELDS = SEGMENTATION_FIELDS + DOWNSTREAM_STATUS_FIELDS
+XSECTION_STATUS_FIELDS = (
+    "run_xsection",
+    "LCx_xsection_CTA_exe_failed",
+    "LCx_xsection_CTA_exe_er_msg",
+    "LCx_xsection_CTA_complete",
+    "mLAD_xsection_CTA_exe_failed",
+    "mLAD_xsection_CTA_exe_er_msg",
+    "mLAD_xsection_CTA_complete",
+    "mRCA_xsection_CTA_exe_failed",
+    "mRCA_xsection_CTA_exe_er_msg",
+    "mRCA_xsection_CTA_complete",
+    "complete_xsection_CTA",
+    "LCx_xsection_seg_exe_failed",
+    "LCx_xsection_seg_exe_er_msg",
+    "LCx_xsection_seg_complete",
+    "mLAD_xsection_seg_exe_failed",
+    "mLAD_xsection_seg_exe_er_msg",
+    "mLAD_xsection_seg_complete",
+    "mRCA_xsection_seg_exe_failed",
+    "mRCA_xsection_seg_exe_er_msg",
+    "mRCA_xsection_seg_complete",
+    "complete_xsection_seg",
+    "LCx_lumen_complete",
+    "LCx_lumen_er_msg",
+    "mLAD_lumen_complete",
+    "mLAD_lumen_er_msg",
+    "mRCA_lumen_complete",
+    "mRCA_lumen_er_msg",
+    "complete_lumen_correction",
+)
+
+PROCESSING_STATUS_FIELDS = (
+    SEGMENTATION_FIELDS + DOWNSTREAM_STATUS_FIELDS + XSECTION_STATUS_FIELDS
+)
 
 PROCESSING_STATUS_DEFAULTS = {
     "run_segmentation": 0,
@@ -84,6 +132,34 @@ PROCESSING_STATUS_DEFAULTS = {
     "filter_mask_failed": 0,
     "filter_mask_er_msg": "",
     "complete_filter_mask": 0,
+    "run_xsection": 0,
+    "LCx_xsection_CTA_exe_failed": 0,
+    "LCx_xsection_CTA_exe_er_msg": "",
+    "LCx_xsection_CTA_complete": 0,
+    "mLAD_xsection_CTA_exe_failed": 0,
+    "mLAD_xsection_CTA_exe_er_msg": "",
+    "mLAD_xsection_CTA_complete": 0,
+    "mRCA_xsection_CTA_exe_failed": 0,
+    "mRCA_xsection_CTA_exe_er_msg": "",
+    "mRCA_xsection_CTA_complete": 0,
+    "complete_xsection_CTA": 0,
+    "LCx_xsection_seg_exe_failed": 0,
+    "LCx_xsection_seg_exe_er_msg": "",
+    "LCx_xsection_seg_complete": 0,
+    "mLAD_xsection_seg_exe_failed": 0,
+    "mLAD_xsection_seg_exe_er_msg": "",
+    "mLAD_xsection_seg_complete": 0,
+    "mRCA_xsection_seg_exe_failed": 0,
+    "mRCA_xsection_seg_exe_er_msg": "",
+    "mRCA_xsection_seg_complete": 0,
+    "complete_xsection_seg": 0,
+    "LCx_lumen_complete": 0,
+    "LCx_lumen_er_msg": "",
+    "mLAD_lumen_complete": 0,
+    "mLAD_lumen_er_msg": "",
+    "mRCA_lumen_complete": 0,
+    "mRCA_lumen_er_msg": "",
+    "complete_lumen_correction": 0,
 }
 
 MANIFEST_FIELDS = (
@@ -141,21 +217,78 @@ class PreparationResult:
     manifest_path: Path
     pipeline_ready: bool
     cases_per_batch: int
+    cta_destinations: tuple
+    preserved_unselected_file_count: int
 
     def summary(self):
-        readiness = "pipeline-ready" if self.pipeline_ready else "canonical CTA only"
-        return (
-            "Prepared {0} cases in {1} batches (up to {2} cases each, {3}); "
-            "copied {4}, unchanged {5}.\nManifest: {6}"
+        destinations = ", ".join(self.cta_destinations)
+        message = (
+            "Prepared {0} cases in {1} batches (up to {2} cases each); "
+            "CTA destinations: {3}; copied {4}, unchanged {5}.\nManifest: {6}"
         ).format(
             self.case_count,
             self.batch_count,
             self.cases_per_batch,
-            readiness,
+            destinations,
             self.copied_file_count,
             self.unchanged_file_count,
             self.manifest_path,
         )
+        if self.preserved_unselected_file_count:
+            message += (
+                "\nWarning: preserved {0} pre-existing CTA file(s) in "
+                "unselected legacy destinations."
+            ).format(self.preserved_unselected_file_count)
+        return message
+
+
+def normalize_cta_destinations(cta_destinations, create_pipeline_folders):
+    """Return validated destination keys in deterministic layout order.
+
+    ``None`` retains the historical programmatic behavior: create every CTA
+    location with the full pipeline layout, or only ``CTA/CTA.nii.gz`` when
+    pipeline folders are disabled.  GUI and normal CLI calls pass an explicit
+    selection so their default can remain the single authoritative OriData CTA.
+    """
+
+    if cta_destinations is None:
+        if create_pipeline_folders:
+            return CTA_DESTINATION_KEYS
+        return ("canonical",)
+
+    if isinstance(cta_destinations, str):
+        requested = (cta_destinations,)
+    else:
+        try:
+            requested = tuple(cta_destinations)
+        except TypeError:
+            raise TypeError("CTA destinations must be a key or an iterable of keys.")
+
+    normalized_requested = []
+    for destination_key in requested:
+        if not isinstance(destination_key, str):
+            raise TypeError("CTA destination keys must be text.")
+        normalized_requested.append(destination_key.strip().lower())
+
+    if not normalized_requested or not any(normalized_requested):
+        raise ValueError("Select at least one CTA destination.")
+
+    unknown_keys = sorted(
+        set(normalized_requested).difference(CTA_DESTINATION_KEYS)
+    )
+    if unknown_keys:
+        raise ValueError(
+            "Unknown CTA destination(s): {0}. Choose from: {1}.".format(
+                ", ".join(unknown_keys), ", ".join(CTA_DESTINATION_KEYS)
+            )
+        )
+
+    requested_set = set(normalized_requested)
+    return tuple(
+        destination_key
+        for destination_key in CTA_DESTINATION_KEYS
+        if destination_key in requested_set
+    )
 
 
 def sanitize_case_id(file_name):
@@ -314,7 +447,12 @@ def sha256_file(file_path):
     return digest.hexdigest()
 
 
-def _validate_existing_targets(plans, output_folder, create_pipeline_folders):
+def _validate_existing_targets(
+    plans,
+    output_folder,
+    create_pipeline_folders,
+    cta_destinations,
+):
     """Reject known target conflicts before creating or replacing anything."""
 
     output_root = Path(output_folder).expanduser()
@@ -331,10 +469,15 @@ def _validate_existing_targets(plans, output_folder, create_pipeline_folders):
         directory_targets = [
             (batch_path, "batch path"),
             (plan.case_path, "case path"),
-            (plan.case_path / "CTA", "CTA path"),
         ]
         if create_pipeline_folders:
             directory_targets.append((batch_path / "Table", "batch Table path"))
+        selected_paths = dict(CTA_DESTINATION_RELATIVE_PATHS)
+        for destination_key in cta_destinations:
+            destination_parent = (plan.case_path / selected_paths[destination_key]).parent
+            directory_targets.append(
+                (destination_parent, "{0} CTA parent".format(destination_key))
+            )
         for path, description in directory_targets:
             if path.exists() and not path.is_dir():
                 raise NotADirectoryError(
@@ -350,12 +493,10 @@ def _validate_existing_targets(plans, output_folder, create_pipeline_folders):
                     "Refusing to replace non-empty DICOM marker: {0}".format(marker_path)
                 )
 
-        destination_paths = [plan.case_path / CANONICAL_CTA_RELATIVE_PATH]
-        if create_pipeline_folders:
-            destination_paths.extend(
-                plan.case_path / relative_path
-                for _, relative_path in PIPELINE_CTA_RELATIVE_PATHS
-            )
+        destination_paths = [
+            plan.case_path / selected_paths[destination_key]
+            for destination_key in cta_destinations
+        ]
         for destination in destination_paths:
             if destination.exists() and not destination.is_file():
                 raise ValueError("Existing CTA destination is not a file: {0}".format(destination))
@@ -467,6 +608,7 @@ def prepare_batch_data(
     create_pipeline_folders=True,
     batch_preproc=None,
     cases_per_batch=DEFAULT_CASES_PER_BATCH,
+    cta_destinations=None,
 ):
     """Prepare, checksum, and record all cases.
 
@@ -475,6 +617,11 @@ def prepare_batch_data(
     """
 
     cases_per_batch = _validate_cases_per_batch(cases_per_batch)
+    selected_destination_keys = normalize_cta_destinations(
+        cta_destinations,
+        create_pipeline_folders,
+    )
+    destination_relative_paths = dict(CTA_DESTINATION_RELATIVE_PATHS)
     plans = build_case_plan(
         input_folder,
         output_folder,
@@ -487,7 +634,12 @@ def prepare_batch_data(
             )
 
     _validate_existing_case_layout(plans, output_folder, cases_per_batch)
-    _validate_existing_targets(plans, output_folder, create_pipeline_folders)
+    _validate_existing_targets(
+        plans,
+        output_folder,
+        create_pipeline_folders,
+        selected_destination_keys,
+    )
 
     # Hash every source before any output is created.  This catches unreadable
     # inputs and also gives every subsequent copy one immutable expected value.
@@ -506,6 +658,7 @@ def prepare_batch_data(
     rows = []
     copied_file_count = 0
     unchanged_file_count = 0
+    preserved_unselected_file_count = 0
 
     for plan, source_info in zip(plans, source_information):
         source_size, source_hash = source_info
@@ -523,34 +676,49 @@ def prepare_batch_data(
             batch_preproc.CreateFolders(CasePath=str(plan.case_path))
 
         destination_results = {}
-        canonical_path = plan.case_path / CANONICAL_CTA_RELATIVE_PATH
-        canonical_hash, copied = _copy_and_verify(
-            plan.source_path, canonical_path, source_size, source_hash
+        for destination_key in selected_destination_keys:
+            destination_path = (
+                plan.case_path / destination_relative_paths[destination_key]
+            )
+            destination_hash, copied = _copy_and_verify(
+                plan.source_path,
+                destination_path,
+                source_size,
+                source_hash,
+            )
+            destination_results[destination_key] = (
+                destination_path,
+                destination_hash,
+            )
+            copied_file_count += int(copied)
+            unchanged_file_count += int(not copied)
+
+        for destination_key, relative_path in CTA_DESTINATION_RELATIVE_PATHS:
+            if destination_key in destination_results:
+                continue
+            if (plan.case_path / relative_path).is_file():
+                preserved_unselected_file_count += 1
+
+        canonical_result = destination_results.get("canonical")
+        canonical_verified = bool(
+            canonical_result and canonical_result[1] == source_hash
         )
-        destination_results["canonical"] = (canonical_path, canonical_hash)
-        copied_file_count += int(copied)
-        unchanged_file_count += int(not copied)
-
-        if create_pipeline_folders:
-            for destination_key, relative_path in PIPELINE_CTA_RELATIVE_PATHS:
-                destination_path = plan.case_path / relative_path
-                destination_hash, copied = _copy_and_verify(
-                    plan.source_path, destination_path, source_size, source_hash
-                )
-                destination_results[destination_key] = (destination_path, destination_hash)
-                copied_file_count += int(copied)
-                unchanged_file_count += int(not copied)
-
-        canonical_verified = canonical_hash == source_hash
-        pipeline_verified = create_pipeline_folders and all(
+        selected_pipeline_keys = tuple(
+            key for key in selected_destination_keys if key != "canonical"
+        )
+        pipeline_verified = bool(selected_pipeline_keys) and all(
             destination_results[key][1] == source_hash
-            for key, _ in PIPELINE_CTA_RELATIVE_PATHS
+            for key in selected_pipeline_keys
         )
-        all_verified = canonical_verified and (
-            pipeline_verified if create_pipeline_folders else True
+        all_verified = all(
+            destination_results[key][1] == source_hash
+            for key in selected_destination_keys
         )
         if not all_verified:
             raise IOError("CTA verification failed for case: {0}".format(plan.case_id))
+
+        canonical_path = canonical_result[0] if canonical_result else None
+        canonical_hash = canonical_result[1] if canonical_result else ""
 
         row = {
             "rank": plan.rank,
@@ -564,8 +732,12 @@ def prepare_batch_data(
             "case_relative_path": plan.case_relative_path,
             "source_size_bytes": source_size,
             "source_sha256": source_hash,
-            "canonical_cta_path": str(canonical_path.resolve()),
-            "canonical_cta_size_bytes": canonical_path.stat().st_size,
+            "canonical_cta_path": (
+                str(canonical_path.resolve()) if canonical_path is not None else ""
+            ),
+            "canonical_cta_size_bytes": (
+                canonical_path.stat().st_size if canonical_path is not None else ""
+            ),
             "canonical_cta_sha256": canonical_hash,
             "canonical_verified": canonical_verified,
             "ori_data_cta_path": "",
@@ -576,7 +748,7 @@ def prepare_batch_data(
             "xsection_fix_ext_cta_sha256": "",
             "ori_volume_cta_path": "",
             "ori_volume_cta_sha256": "",
-            "pipeline_copies_requested": create_pipeline_folders,
+            "pipeline_copies_requested": bool(selected_pipeline_keys),
             "pipeline_copies_verified": pipeline_verified,
             "all_verified": all_verified,
         }
@@ -609,8 +781,12 @@ def prepare_batch_data(
         copied_file_count=copied_file_count,
         unchanged_file_count=unchanged_file_count,
         manifest_path=manifest_path.resolve(),
-        pipeline_ready=create_pipeline_folders,
+        pipeline_ready=(
+            create_pipeline_folders and "ori_data" in selected_destination_keys
+        ),
         cases_per_batch=cases_per_batch,
+        cta_destinations=selected_destination_keys,
+        preserved_unselected_file_count=preserved_unselected_file_count,
     )
 
 
@@ -680,6 +856,7 @@ class BatchNIIDataPrepare:
         output_folder=None,
         create_folders=None,
         cases_per_batch=None,
+        cta_destinations=None,
     ):
         if input_folder is None:
             input_folder = _widget_text(self.ui.InputFolderPath_Txt_BNDP)
@@ -693,6 +870,19 @@ class BatchNIIDataPrepare:
                 if self.ui is not None
                 else DEFAULT_CASES_PER_BATCH
             )
+        if cta_destinations is None and self.ui is not None:
+            destination_widgets = [
+                (destination_key, getattr(self.ui, widget_name, None))
+                for destination_key, widget_name in CTA_DESTINATION_WIDGET_NAMES
+            ]
+            if any(widget is not None for _, widget in destination_widgets):
+                cta_destinations = tuple(
+                    destination_key
+                    for destination_key, widget in destination_widgets
+                    if widget is not None and widget.isChecked()
+                )
+            else:
+                cta_destinations = DEFAULT_CTA_DESTINATIONS
 
         try:
             result = prepare_batch_data(
@@ -701,6 +891,7 @@ class BatchNIIDataPrepare:
                 create_pipeline_folders=create_folders,
                 batch_preproc=self.batch_preproc,
                 cases_per_batch=cases_per_batch,
+                cta_destinations=cta_destinations,
             )
             message = result.summary()
         except Exception as error:
@@ -757,8 +948,24 @@ def main(arguments=None):
         action="store_true",
         help="Create only 0.dcm and CTA/CTA.nii.gz, without the pipeline folders.",
     )
+    parser.add_argument(
+        "--cta-destination",
+        action="append",
+        choices=CTA_DESTINATION_KEYS,
+        help=(
+            "CTA destination key; repeat for multiple destinations. "
+            "Defaults to ori_data."
+        ),
+    )
     options = parser.parse_args(arguments)
+    if options.canonical_only and options.cta_destination:
+        parser.error("--canonical-only cannot be combined with --cta-destination.")
     create_pipeline_folders = not options.canonical_only
+    cta_destinations = (
+        ("canonical",)
+        if options.canonical_only
+        else tuple(options.cta_destination or DEFAULT_CTA_DESTINATIONS)
+    )
     batch_preproc = (
         _load_standalone_batch_preproc() if create_pipeline_folders else None
     )
@@ -768,6 +975,7 @@ def main(arguments=None):
         create_pipeline_folders=create_pipeline_folders,
         batch_preproc=batch_preproc,
         cases_per_batch=options.cases_per_batch,
+        cta_destinations=cta_destinations,
     )
     print(result.summary())
     return 0

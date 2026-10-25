@@ -7,7 +7,7 @@
     <x>0</x>
     <y>0</y>
     <width>900</width>
-    <height>620</height>
+    <height>780</height>
    </rect>
   </property>
   <property name="windowTitle">
@@ -67,7 +67,7 @@
        <item row="0" column="1">
         <widget class="QLineEdit" name="InputFolderPath_Txt_BNDP">
          <property name="text">
-          <string>G:\FishAndChips_C2\test_codex\temp_nii</string>
+          <string>S:\04_JZ\FishAndChips_C2\0_Raw_Data</string>
          </property>
          <property name="placeholderText">
           <string>Folder containing .nii.gz files</string>
@@ -91,7 +91,7 @@
        <item row="1" column="1">
         <widget class="QLineEdit" name="OutputFolderPath_Txt_BNDP">
          <property name="text">
-          <string>G:\FishAndChips_C2\test_codex</string>
+          <string>S:\04_JZ\FishAndChips_C2</string>
          </property>
          <property name="placeholderText">
           <string>0_Initial_Segmentation will be created here</string>
@@ -134,11 +134,73 @@
     <item>
      <widget class="QCheckBox" name="CreateFolders_CB_BNDP">
       <property name="text">
-       <string>Create BatchCoronary folders and verified downstream CTA copies</string>
+       <string>Create full BatchCoronary folder structure</string>
       </property>
       <property name="checked">
        <bool>true</bool>
       </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QGroupBox" name="CTADestinations_Group_BNDP">
+      <property name="title">
+       <string>CTA destinations (select at least one)</string>
+      </property>
+      <layout class="QVBoxLayout" name="ctaDestinationsLayout_BNDP">
+       <item>
+        <widget class="QCheckBox" name="CopyOriDataCTA_CB_BNDP">
+         <property name="toolTip">
+          <string>Recommended authoritative CTA used by BatchCoronary and BatchSliceRadiomics after the single-CTA path update.</string>
+         </property>
+         <property name="text">
+          <string>Preproc/OriData/CTA.nii.gz (recommended; all current workflows)</string>
+         </property>
+         <property name="checked">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="CopyCanonicalCTA_CB_BNDP">
+         <property name="toolTip">
+          <string>Legacy location used by DICOM conversion, the old Copy CTA step, and legacy CTA-based case discovery.</string>
+         </property>
+         <property name="text">
+          <string>CTA/CTA.nii.gz (legacy discovery and DICOM conversion)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="CopyBranchesCTA_CB_BNDP">
+         <property name="toolTip">
+          <string>Compatibility copy for older cross-section tables; new tables read the OriData CTA.</string>
+         </property>
+         <property name="text">
+          <string>Preproc/OriData/Branches/CTA.nii.gz (legacy Xsection)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="CopyXsectionFixExtCTA_CB_BNDP">
+         <property name="toolTip">
+          <string>Compatibility copy for older Xsection OriVolume tables; new tables read the OriData CTA.</string>
+         </property>
+         <property name="text">
+          <string>Preproc/XsectionFixExt/CTA.nii.gz (legacy Xsection OriVolume)</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QCheckBox" name="CopyOriVolumeCTA_CB_BNDP">
+         <property name="toolTip">
+          <string>Compatibility copy for older OriVolume Correction tables; new tables read the OriData CTA.</string>
+         </property>
+         <property name="text">
+          <string>Preproc/OriVolume/CTA.nii.gz (legacy OriVolume Correction)</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
      </widget>
     </item>
     <item>
@@ -147,7 +209,7 @@
        <string notr="true">color: #a65f00;</string>
       </property>
       <property name="text">
-        <string>Important: 0.dcm is an empty discovery marker, not a valid DICOM file. Keep DCM To Nifti unchecked in Batch Pre Processing. Use a new or empty output parent when changing Cases per batch.</string>
+        <string>Important: 0.dcm is an empty discovery marker, not a valid DICOM file. Keep DCM To Nifti and legacy Copy CTA unchecked for prepared NIfTI batches. Deselected existing CTA files are preserved, not deleted.</string>
       </property>
       <property name="wordWrap">
        <bool>true</bool>

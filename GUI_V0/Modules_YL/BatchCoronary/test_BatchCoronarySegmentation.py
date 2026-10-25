@@ -61,8 +61,6 @@ def make_case(batch_path, case_id):
     ori_data_path = case_path / "Preproc" / "OriData"
     ori_data_path.mkdir(parents=True)
     (ori_data_path / "CTA.nii.gz").write_bytes(b"cta")
-    (case_path / "CTA").mkdir()
-    (case_path / "CTA" / "CTA.nii.gz").write_bytes(b"cta")
     (case_path / "0.dcm").write_bytes(b"")
     return case_path
 
@@ -743,6 +741,90 @@ class SegmentationRecordTests(unittest.TestCase):
             )
             self.assertIn("CASE_TABLE_OK", aggregate_text)
             self.assertNotIn("CASE_TABLE_FAIL", aggregate_text)
+
+    def test_generated_tables_reuse_the_single_ori_data_cta(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths = make_batch_controller(
+                temporary_directory,
+                ("CASE_SINGLE_CTA",),
+            )
+            case_path = case_paths[0]
+            controller.CreateFolders(str(case_path))
+            branch = {
+                "branch_name": "mLAD",
+                "label": [7],
+                "branch_label": "2,1,1",
+                "use": True,
+                "original_csv": "mLADExt.csv",
+                "3D_csv": "mLAD3D.csv",
+                "original_branch": "mLAD_OriB_",
+                "cross_section_image_LI": "mLADCTALI.nii.gz",
+                "cross_section_mask_NN": "mLADValNN.nii.gz",
+                "cross_section_mask_fix": "mLADValNNFixVal.nii.gz",
+                "cross_section_mask_fix_extension": "mLADValNNFE.nii.gz",
+                "original_volume_mask_fix": "mLADValNNFEOV.nii.gz",
+            }
+            use_json_path = (
+                case_path / "Preproc" / "CSV" / "coronarySegmentsUse.json"
+            )
+            use_json_path.write_text(json.dumps([branch]), encoding="utf-8")
+
+            controller.DCMDirList = [str(case_path)]
+            controller.StoreListInformation()
+            controller.ui = TableGenerationUI(temporary_directory)
+            controller.CPREXEPath = "cpr.exe"
+            controller.STLEXEPath = "stl.exe"
+            controller.getFFRresult = False
+            controller.getIFRresult = False
+
+            successful_cases = controller.GenerateTable()
+
+            self.assertEqual(successful_cases, [str(case_path)])
+            ori_data_path = case_path / "Preproc" / "OriData"
+            authoritative_cta = ori_data_path / "CTA.nii.gz"
+            self.assertTrue(authoritative_cta.is_file())
+            self.assertFalse((case_path / "CTA" / "CTA.nii.gz").exists())
+            self.assertFalse((ori_data_path / "Branches" / "CTA.nii.gz").exists())
+            self.assertFalse(
+                (case_path / "Preproc" / "XsectionFixExt" / "CTA.nii.gz").exists()
+            )
+            self.assertFalse(
+                (case_path / "Preproc" / "OriVolume" / "CTA.nii.gz").exists()
+            )
+
+            self.assertEqual(
+                Path(controller.XsectionTable[0][0]),
+                ori_data_path,
+            )
+            case_rows = read_csv(case_path / "Preproc" / "CSV" / "case.csv")
+            self.assertEqual(len(case_rows), 2)
+            self.assertEqual(
+                Path(controller.XsectionTable[0][0])
+                / case_rows[0]["inputImagePath"],
+                authoritative_cta,
+            )
+            self.assertEqual(
+                Path(controller.XsectionTable[0][0])
+                / case_rows[1]["inputImagePath"],
+                ori_data_path / "Branches" / "mLAD_OriB_Val.nii.gz",
+            )
+
+            ori_volume_row = controller.OriVolumeTable[0]
+            self.assertEqual(
+                Path(ori_volume_row[0]) / ori_volume_row[1],
+                authoritative_cta,
+            )
+            self.assertEqual(
+                Path(ori_volume_row[0]) / ori_volume_row[2],
+                case_path
+                / "Preproc"
+                / "XsectionFixExt"
+                / "mLADValNNFE.nii.gz",
+            )
+            self.assertEqual(
+                Path(controller.OriVolumeFixTable[0][0]),
+                authoritative_cta,
+            )
 
 
 class CenterlineCsvValidationTests(unittest.TestCase):
