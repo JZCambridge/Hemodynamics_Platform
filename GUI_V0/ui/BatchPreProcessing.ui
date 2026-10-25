@@ -43,7 +43,7 @@
             <number>9</number>
            </property>
            <item>
-            <layout class="QVBoxLayout" name="verticalLayout_1_BPP" stretch="1,0,2,2,2,2,0,0,0,0,0,0,0,0,0,0,0,4,0,1">
+             <layout class="QVBoxLayout" name="verticalLayout_1_BPP" stretch="1,0,2,2,2,2,0,2,2,0,0,0,0,0,0,0,0,0,0,0,4,0,1">
              <property name="spacing">
               <number>1</number>
              </property>
@@ -137,7 +137,7 @@
 &lt;html&gt;&lt;head&gt;&lt;meta name=&quot;qrichtext&quot; content=&quot;1&quot; /&gt;&lt;style type=&quot;text/css&quot;&gt;
 p, li { white-space: pre-wrap; }
 &lt;/style&gt;&lt;/head&gt;&lt;body style=&quot; font-family:'SimSun'; font-size:9pt; font-weight:400; font-style:normal;&quot;&gt;
-&lt;p style=&quot; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;K:/Test&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+&lt;p style=&quot; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;G:/FishAndChips_C2/test_codex/0_Initial_Segmentation/batch_0&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
                  </property>
                 </widget>
                </item>
@@ -184,7 +184,7 @@ p, li { white-space: pre-wrap; }
 &lt;html&gt;&lt;head&gt;&lt;meta name=&quot;qrichtext&quot; content=&quot;1&quot; /&gt;&lt;style type=&quot;text/css&quot;&gt;
 p, li { white-space: pre-wrap; }
 &lt;/style&gt;&lt;/head&gt;&lt;body style=&quot; font-family:'SimSun'; font-size:9pt; font-weight:400; font-style:normal;&quot;&gt;
-&lt;p style=&quot; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;&lt;span style=&quot; font-family:'Arial';&quot;&gt;E:/GUI/Hedys/Base/centerline_julio/Tenoke_CCTA_210722/Tenoke_ccta_dl_segment_label_Part1_tfmkl/Tenoke_ccta_dl_segment_label.exe&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+&lt;p style=&quot; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;&lt;span style=&quot; font-family:'Arial';&quot;&gt;D:/Software/HymoV01_270424/Base/centerline_julio/Tenoke_CCTA_210722/Tenoke_ccta_dl_segment_label_Part1_tfmkl/Tenoke_ccta_dl_segment_label.exe&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
                  </property>
                 </widget>
                </item>
@@ -194,6 +194,135 @@ p, li { white-space: pre-wrap; }
                   <string>Choose</string>
                  </property>
                 </widget>
+               </item>
+              </layout>
+             </item>
+             <item>
+              <layout class="QHBoxLayout" name="horizontalLayout_Manifest_BPP" stretch="2,6,2">
+               <item>
+                <widget class="QLabel" name="ManifestPath_Label_BPP">
+                 <property name="text">
+                  <string>Manifest CSV</string>
+                 </property>
+                 <property name="alignment">
+                  <set>Qt::AlignCenter</set>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QTextBrowser" name="ManifestPath_Txt_BPP">
+                 <property name="sizePolicy">
+                  <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+                   <horstretch>0</horstretch>
+                   <verstretch>0</verstretch>
+                  </sizepolicy>
+                 </property>
+                 <property name="minimumSize">
+                  <size>
+                   <width>0</width>
+                   <height>100</height>
+                  </size>
+                 </property>
+                 <property name="readOnly">
+                  <bool>false</bool>
+                 </property>
+                 <property name="plainText">
+                  <string>G:/FishAndChips_C2/test_codex/0_Initial_Segmentation/BatchNIIDataPrepare_manifest.csv</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QPushButton" name="ChooseManifestPathBtn_BPP">
+                 <property name="text">
+                  <string>Choose</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </item>
+             <item>
+              <layout class="QHBoxLayout" name="horizontalLayout_FailedRoot_BPP" stretch="2,6,2">
+               <item>
+                <widget class="QLabel" name="FailedRootPath_Label_BPP">
+                 <property name="text">
+                  <string>Failed Output Root</string>
+                 </property>
+                 <property name="alignment">
+                  <set>Qt::AlignCenter</set>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QTextBrowser" name="FailedRootPath_Txt_BPP">
+                 <property name="sizePolicy">
+                  <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+                   <horstretch>0</horstretch>
+                   <verstretch>0</verstretch>
+                  </sizepolicy>
+                 </property>
+                 <property name="minimumSize">
+                  <size>
+                   <width>0</width>
+                   <height>100</height>
+                  </size>
+                 </property>
+                 <property name="readOnly">
+                  <bool>false</bool>
+                 </property>
+                 <property name="plainText">
+                  <string>G:/FishAndChips_C2/test_codex</string>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QPushButton" name="ChooseFailedRootPathBtn_BPP">
+                 <property name="text">
+                  <string>Choose</string>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </item>
+             <item>
+              <layout class="QHBoxLayout" name="horizontalLayout_SegmentationTimeout_BPP" stretch="2,6,2">
+               <item>
+                <widget class="QLabel" name="SegmentationTimeout_Label_BPP">
+                 <property name="text">
+                  <string>EXE Timeout</string>
+                 </property>
+                 <property name="alignment">
+                  <set>Qt::AlignCenter</set>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <widget class="QSpinBox" name="SegmentationTimeout_SB_BPP">
+                 <property name="suffix">
+                  <string> min / stage</string>
+                 </property>
+                 <property name="minimum">
+                  <number>1</number>
+                 </property>
+                 <property name="maximum">
+                  <number>1440</number>
+                 </property>
+                 <property name="value">
+                   <number>20</number>
+                 </property>
+                </widget>
+               </item>
+               <item>
+                <spacer name="horizontalSpacer_SegmentationTimeout_BPP">
+                 <property name="orientation">
+                  <enum>Qt::Horizontal</enum>
+                 </property>
+                 <property name="sizeHint" stdset="0">
+                  <size>
+                   <width>40</width>
+                   <height>20</height>
+                  </size>
+                 </property>
+                </spacer>
                </item>
               </layout>
              </item>
@@ -835,7 +964,7 @@ p, li { white-space: pre-wrap; }
                     <string>mLCX (LCx)</string>
                    </property>
                    <property name="checked">
-                    <bool>false</bool>
+                    <bool>true</bool>
                    </property>
                   </widget>
                  </item>
@@ -845,7 +974,7 @@ p, li { white-space: pre-wrap; }
                     <string>OM1</string>
                    </property>
                    <property name="checked">
-                    <bool>false</bool>
+                    <bool>true</bool>
                    </property>
                   </widget>
                  </item>
@@ -861,7 +990,7 @@ p, li { white-space: pre-wrap; }
                     <string>dLCX</string>
                    </property>
                    <property name="checked">
-                    <bool>false</bool>
+                    <bool>true</bool>
                    </property>
                   </widget>
                  </item>
@@ -877,7 +1006,7 @@ p, li { white-space: pre-wrap; }
                     <string>OM2</string>
                    </property>
                    <property name="checked">
-                    <bool>false</bool>
+                    <bool>true</bool>
                    </property>
                   </widget>
                  </item>
@@ -946,7 +1075,7 @@ p, li { white-space: pre-wrap; }
                     <string>V</string>
                    </property>
                    <property name="checked">
-                    <bool>false</bool>
+                    <bool>true</bool>
                    </property>
                   </widget>
                  </item>
@@ -956,7 +1085,7 @@ p, li { white-space: pre-wrap; }
                     <string>AM</string>
                    </property>
                    <property name="checked">
-                    <bool>false</bool>
+                    <bool>true</bool>
                    </property>
                   </widget>
                  </item>
@@ -966,7 +1095,7 @@ p, li { white-space: pre-wrap; }
                     <string>CB</string>
                    </property>
                    <property name="checked">
-                    <bool>false</bool>
+                    <bool>true</bool>
                    </property>
                   </widget>
                  </item>
@@ -1119,7 +1248,7 @@ p, li { white-space: pre-wrap; }
                     <string>Copy JSON (before centerline extraction)</string>
                    </property>
                    <property name="checked">
-                    <bool>false</bool>
+                    <bool>true</bool>
                    </property>
                   </widget>
                  </item>
@@ -1162,7 +1291,7 @@ p, li { white-space: pre-wrap; }
                     <string>Mask Generation (CTA copy needed)</string>
                    </property>
                    <property name="checked">
-                    <bool>false</bool>
+                    <bool>true</bool>
                    </property>
                   </widget>
                  </item>
@@ -1172,7 +1301,7 @@ p, li { white-space: pre-wrap; }
                     <string>Centerline Extraction (need copy CTA first</string>
                    </property>
                    <property name="checked">
-                    <bool>false</bool>
+                    <bool>true</bool>
                    </property>
                   </widget>
                  </item>
@@ -1182,7 +1311,7 @@ p, li { white-space: pre-wrap; }
                     <string>Centerline Jason Update (if need to update JSON with CSV)</string>
                    </property>
                    <property name="checked">
-                    <bool>false</bool>
+                    <bool>true</bool>
                    </property>
                   </widget>
                  </item>
@@ -1192,7 +1321,7 @@ p, li { white-space: pre-wrap; }
                     <string>Branch Dictionary</string>
                    </property>
                    <property name="checked">
-                    <bool>false</bool>
+                    <bool>true</bool>
                    </property>
                   </widget>
                  </item>
@@ -1202,7 +1331,7 @@ p, li { white-space: pre-wrap; }
                     <string>Generate Table</string>
                    </property>
                    <property name="checked">
-                    <bool>false</bool>
+                    <bool>true</bool>
                    </property>
                   </widget>
                  </item>
@@ -1212,7 +1341,7 @@ p, li { white-space: pre-wrap; }
                     <string>Filter Mask</string>
                    </property>
                    <property name="checked">
-                    <bool>false</bool>
+                    <bool>true</bool>
                    </property>
                   </widget>
                  </item>
@@ -1292,7 +1421,7 @@ p, li { white-space: pre-wrap; }
                     <string>Get FFR result</string>
                    </property>
                    <property name="checked">
-                    <bool>true</bool>
+                    <bool>false</bool>
                    </property>
                   </widget>
                  </item>
@@ -1302,7 +1431,7 @@ p, li { white-space: pre-wrap; }
                     <string>Get IFR result</string>
                    </property>
                    <property name="checked">
-                    <bool>true</bool>
+                    <bool>false</bool>
                    </property>
                   </widget>
                  </item>

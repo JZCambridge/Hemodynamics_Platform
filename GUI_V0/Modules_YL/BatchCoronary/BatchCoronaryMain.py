@@ -1,11 +1,19 @@
 import os
 import sys
+import csv
+import hashlib
 import pandas as pd
 import re
 import json
+import string
+import ntpath
 import pyparsing
 import time
+import shutil
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 import numpy
 
 os.chdir(os.getcwd())
@@ -15,6 +23,892 @@ import Preprocess_Mask
 import Pd_Funs
 # Import functions self-written
 from Modules_YL.BatchCoronary import BranchDictionary
+
+
+SEGMENTATION_CORE_STATUS_FIELDS = (
+    'run_segmentation',
+    'seg_exe_failed',
+    'seg_exe_er_msg',
+    'coronary_segment_failed',
+    'complete_segmentation',
+)
+CENTERLINE_CSV_STATUS_FIELDS = (
+    'run_centerline_csv_check',
+    'centerline_csv_failed',
+    'centerline_csv_er_msg',
+    'complete_centerline_csv',
+)
+FILTER_MASK_STATUS_FIELDS = (
+    'run_filter_mask',
+    'filter_mask_failed',
+    'filter_mask_er_msg',
+    'complete_filter_mask',
+)
+SEGMENTATION_STATUS_DEFAULTS = {
+    'run_segmentation': 0,
+    'seg_exe_failed': 0,
+    'seg_exe_er_msg': '',
+    'coronary_segment_failed': 0,
+    'complete_segmentation': 0,
+    'run_centerline_csv_check': 0,
+    'centerline_csv_failed': 0,
+    'centerline_csv_er_msg': '',
+    'complete_centerline_csv': 0,
+    'run_filter_mask': 0,
+    'filter_mask_failed': 0,
+    'filter_mask_er_msg': '',
+    'complete_filter_mask': 0,
+}
+SEGMENTATION_STATUS_FIELDS = (
+    SEGMENTATION_CORE_STATUS_FIELDS
+    + CENTERLINE_CSV_STATUS_FIELDS
+    + FILTER_MASK_STATUS_FIELDS
+)
+SEGMENTATION_RECORD_FIELDS = (
+    'case_id',
+    'batch_name',
+    'case_relative_path',
+    'source_sha256',
+    'centerline_json_source_sha256',
+    'filter_mask_input_sha256',
+) + SEGMENTATION_STATUS_FIELDS
+SEGMENTATION_RECORD_FOLDER = 'seg_record'
+SEGMENTATION_RECORD_FILE = 'batch_seg.csv'
+SEGMENTATION_MASK_RELATIVE_PATH = Path('Preproc') / 'OriData' / 'sc_labelled_coronary_segment.nii.gz'
+DEFAULT_SEGMENTATION_TIMEOUT_MINUTES = 20
+DEFAULT_MANIFEST_FILE_NAME = 'BatchNIIDataPrepare_manifest.csv'
+FAILED_SEGMENTATION_FOLDER_NAME = '0_Failed_Segmentation'
+LOCK_POLL_SECONDS = 0.1
+LOCK_TIMEOUT_SECONDS = 120
+MAX_SEGMENTATION_ERROR_LENGTH = 4000
+HASH_BLOCK_SIZE = 1024 * 1024
+CENTERLINE_SIDES = ('L', 'R')
+CENTERLINE_JSON_NAME = '{0}_coronary_centerline_network.json'
+CENTERLINE_AGGREGATE_CSV_NAME = '{0}_coronary_centerline_network.csv'
+FILTER_MASK_REQUIRED_COLUMNS = (
+    'MaskPath', 'MaskVal', 'NewMaskVal', 'OutputFolder', 'FileNameRef'
+)
+GENERATED_TABLE_ATTRIBUTES = (
+    'FilterMaskTable',
+    'XsectionTable',
+    'XsectionFixTable',
+    'XsectionFixExtTable',
+    'OriVolumeTable',
+    'SSTable',
+    'SGTable',
+    'AVCTable',
+    'OriVolumeFixTable',
+    'CFD_MeshTable',
+    'CFD_STLcutTable',
+    'CFD_STLmeshTable',
+    'CFD_FindFaceTable',
+    'CFD_GenerateInTable',
+    'CFD_PostProgressTable',
+    'DataOutputTable',
+    'PostNpyTable',
+    'Map_ResultTable',
+    'FFRCalculationTable',
+    'ParaviewTable',
+    'SaveVtuTable',
+)
+
+
+def _clean_error_message(message, limit=MAX_SEGMENTATION_ERROR_LENGTH):
+    """Return a compact, single-line error suitable for a CSV cell."""
+
+    message = ' '.join(str(message or '').replace('\x00', '').split())
+    if len(message) <= limit:
+        return message
+    marker = ' ...[truncated]... '
+    if limit <= len(marker) + 2:
+        return message[:limit]
+    prefix_length = (limit - len(marker)) // 2
+    suffix_length = limit - len(marker) - prefix_length
+    return message[:prefix_length] + marker + message[-suffix_length:]
+
+
+def _widget_text(widget):
+    if widget is None:
+        return ''
+    for method_name in ('toPlainText', 'text'):
+        method = getattr(widget, method_name, None)
+        if callable(method):
+            return str(method()).strip()
+    return ''
+
+
+def _widget_integer(widget, default):
+    if widget is None:
+        return default
+    value_method = getattr(widget, 'value', None)
+    if not callable(value_method):
+        return default
+    try:
+        return int(value_method())
+    except (TypeError, ValueError):
+        return default
+
+
+def is_complete_segmentation(case_path):
+    """Return whether the requested coronary segmentation exists and is nonempty."""
+
+    mask_path = Path(case_path) / SEGMENTATION_MASK_RELATIVE_PATH
+    try:
+        return mask_path.is_file() and mask_path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _sha256_file(file_path):
+    digest = hashlib.sha256()
+    with Path(file_path).open('rb') as file_object:
+        while True:
+            block = file_object.read(HASH_BLOCK_SIZE)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _hash_text_parts(parts):
+    digest = hashlib.sha256()
+    for part in parts:
+        encoded_part = str(part).encode('utf-8')
+        digest.update(str(len(encoded_part)).encode('ascii'))
+        digest.update(b':')
+        digest.update(encoded_part)
+        digest.update(b'\n')
+    return digest.hexdigest()
+
+
+def _is_nonempty_regular_file(file_path):
+    file_path = Path(file_path)
+    try:
+        return file_path.is_file() and file_path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def validate_centerline_json(json_path):
+    """Load and validate one vendor centerline JSON document."""
+
+    json_path = Path(json_path)
+    if not _is_nonempty_regular_file(json_path):
+        raise ValueError('missing or empty centerline JSON: {0}'.format(json_path))
+    try:
+        with json_path.open('r', encoding='utf-8-sig') as json_file:
+            centerlines = json.load(json_file)
+    except Exception as error:
+        raise ValueError(
+            'could not read centerline JSON {0}: {1}'.format(json_path, error)
+        )
+    if not isinstance(centerlines, list) or not centerlines:
+        raise ValueError(
+            'centerline JSON must contain a nonempty list: {0}'.format(json_path)
+        )
+
+    branch_names = set()
+    for branch_index, branch in enumerate(centerlines):
+        if not isinstance(branch, dict):
+            raise ValueError(
+                'centerline branch {0} is not an object: {1}'.format(
+                    branch_index, json_path
+                )
+            )
+        branch_name = branch.get('branch_name')
+        if not isinstance(branch_name, str) or not branch_name.strip():
+            raise ValueError(
+                'centerline branch {0} has no branch_name: {1}'.format(
+                    branch_index, json_path
+                )
+            )
+        # Vendor JSON intentionally distinguishes names by case.  For example,
+        # ``LCx`` is an anatomical branch while ``LCX`` is an aggregate branch.
+        # Reject only an exact duplicate after trimming surrounding whitespace.
+        normalized_name = branch_name.strip()
+        if normalized_name in branch_names:
+            raise ValueError(
+                'duplicate centerline branch {0}: {1}'.format(branch_name, json_path)
+            )
+        branch_names.add(normalized_name)
+        coordinates = branch.get('coordinates')
+        if not isinstance(coordinates, list):
+            raise ValueError(
+                'coordinates for branch {0} are not a list: {1}'.format(
+                    branch_name, json_path
+                )
+            )
+        for coordinate_index, coordinate in enumerate(coordinates):
+            if not isinstance(coordinate, dict):
+                raise ValueError(
+                    'coordinate {0} for branch {1} is not an object: {2}'.format(
+                        coordinate_index, branch_name, json_path
+                    )
+                )
+            for axis in ('X', 'Y', 'Z'):
+                value = coordinate.get(axis)
+                if isinstance(value, bool) or not isinstance(value, int):
+                    raise ValueError(
+                        'coordinate {0} for branch {1} has invalid {2}: {3}'.format(
+                            coordinate_index, branch_name, axis, json_path
+                        )
+                    )
+        if branch_name in ('.', '..') or '/' in branch_name or '\\' in branch_name:
+            raise ValueError(
+                'centerline branch name is not a safe filename: {0}'.format(
+                    branch_name
+                )
+            )
+    return centerlines
+
+
+def resolve_centerline_json_source(case_path, side):
+    """Resolve a valid ``.json`` or ``.json.txt`` source without guessing."""
+
+    if side not in CENTERLINE_SIDES:
+        raise ValueError('Unsupported centerline side: {0}'.format(side))
+    ori_data_path = Path(case_path) / 'Preproc' / 'OriData'
+    canonical_name = CENTERLINE_JSON_NAME.format(side)
+    candidates = (
+        ori_data_path / canonical_name,
+        ori_data_path / (canonical_name + '.txt'),
+    )
+    valid_candidates = []
+    candidate_errors = []
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        try:
+            data = validate_centerline_json(candidate)
+            normalized_data = json.dumps(
+                data, sort_keys=True, separators=(',', ':'), ensure_ascii=False
+            )
+            valid_candidates.append((candidate, data, normalized_data))
+        except Exception as error:
+            candidate_errors.append(str(error))
+
+    if not valid_candidates:
+        detail = '; '.join(candidate_errors) or 'no source file found'
+        raise ValueError(
+            '{0} centerline JSON source is unavailable: {1}'.format(side, detail)
+        )
+    normalized_documents = {item[2] for item in valid_candidates}
+    if len(normalized_documents) > 1:
+        raise ValueError(
+            'conflicting {0} centerline .json and .json.txt sources'.format(side)
+        )
+    return valid_candidates[0]
+
+
+def _copy_file_atomic(source_path, destination_path):
+    source_path = Path(source_path)
+    destination_path = Path(destination_path)
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix='.{0}.'.format(destination_path.name),
+        suffix='.tmp',
+        dir=str(destination_path.parent),
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        shutil.copy2(str(source_path), str(temporary_path))
+        if _sha256_file(temporary_path) != _sha256_file(source_path):
+            raise IOError(
+                'centerline JSON copy verification failed: {0}'.format(source_path)
+            )
+        os.replace(str(temporary_path), str(destination_path))
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def centerline_json_source_fingerprint(case_path):
+    resolved = []
+    for side in CENTERLINE_SIDES:
+        source_path, data, normalized_data = resolve_centerline_json_source(
+            case_path, side
+        )
+        resolved.append((side, source_path, data, normalized_data))
+    fingerprint = _hash_text_parts(
+        [item[0] + ':' + item[3] for item in resolved]
+    )
+    return fingerprint, resolved
+
+
+def stage_centerline_json_pair(case_path):
+    """Publish both validated source JSONs under their canonical CSV names."""
+
+    fingerprint, resolved = centerline_json_source_fingerprint(case_path)
+    csv_path = Path(case_path) / 'Preproc' / 'CSV'
+    csv_path.mkdir(parents=True, exist_ok=True)
+    temporary_paths = {}
+    backup_paths = {}
+    published_paths = []
+    publication_complete = False
+    try:
+        # Prepare and validate both copies before either canonical file changes.
+        for side, source_path, _data, _normalized_data in resolved:
+            destination_path = csv_path / CENTERLINE_JSON_NAME.format(side)
+            file_descriptor, temporary_name = tempfile.mkstemp(
+                prefix='.{0}.'.format(destination_path.name),
+                suffix='.tmp',
+                dir=str(csv_path),
+            )
+            os.close(file_descriptor)
+            temporary_path = Path(temporary_name)
+            shutil.copy2(str(source_path), str(temporary_path))
+            if _sha256_file(temporary_path) != _sha256_file(source_path):
+                raise IOError(
+                    'centerline JSON copy verification failed: {0}'.format(
+                        source_path
+                    )
+                )
+            validate_centerline_json(temporary_path)
+            temporary_paths[destination_path] = temporary_path
+
+        # Preserve both old files so a failure publishing the second side can
+        # roll the pair back to its exact prior state.
+        for destination_path in temporary_paths:
+            if not destination_path.exists():
+                continue
+            if not destination_path.is_file():
+                raise ValueError(
+                    'Existing centerline JSON destination is not a file: {0}'
+                    .format(destination_path)
+                )
+            file_descriptor, backup_name = tempfile.mkstemp(
+                prefix='.{0}.'.format(destination_path.name),
+                suffix='.bak',
+                dir=str(csv_path),
+            )
+            os.close(file_descriptor)
+            backup_path = Path(backup_name)
+            backup_path.unlink()
+            os.replace(str(destination_path), str(backup_path))
+            backup_paths[destination_path] = backup_path
+
+        for destination_path, temporary_path in temporary_paths.items():
+            os.replace(str(temporary_path), str(destination_path))
+            published_paths.append(destination_path)
+        publication_complete = True
+    except Exception as publication_error:
+        restoration_errors = []
+        for destination_path in published_paths:
+            try:
+                if destination_path.exists():
+                    destination_path.unlink()
+            except OSError as error:
+                restoration_errors.append(str(error))
+        for destination_path, backup_path in backup_paths.items():
+            if backup_path.exists():
+                try:
+                    os.replace(str(backup_path), str(destination_path))
+                except OSError as error:
+                    restoration_errors.append(
+                        '{0} remains at {1}: {2}'.format(
+                            destination_path, backup_path, error
+                        )
+                    )
+        if restoration_errors:
+            raise RuntimeError(
+                'Centerline JSON publication failed ({0}); rollback also '
+                'reported: {1}'.format(
+                    publication_error, '; '.join(restoration_errors)
+                )
+            )
+        raise
+    finally:
+        for temporary_path in temporary_paths.values():
+            if temporary_path.exists():
+                temporary_path.unlink()
+    if publication_complete:
+        for backup_path in backup_paths.values():
+            try:
+                if backup_path.exists():
+                    backup_path.unlink()
+            except OSError:
+                # The new pair is already verified and published. Retaining an
+                # old backup is safer than turning cleanup into data loss.
+                pass
+    return fingerprint
+
+
+def _validate_aggregate_centerline_csv(csv_path):
+    csv_path = Path(csv_path)
+    if not _is_nonempty_regular_file(csv_path):
+        raise ValueError('missing or empty aggregate centerline CSV: {0}'.format(csv_path))
+    try:
+        with csv_path.open('r', encoding='utf-8-sig', newline='') as csv_file:
+            reader = csv.DictReader(csv_file)
+            fieldnames = set(reader.fieldnames or ())
+            if not {'branch_name', 'coordinates'}.issubset(fieldnames):
+                raise ValueError(
+                    'aggregate CSV is missing branch_name/coordinates columns'
+                )
+            first_row = next(reader, None)
+            if first_row is None:
+                raise ValueError('aggregate CSV has no data rows')
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError('could not read aggregate CSV: {0}'.format(error))
+
+
+def _validate_branch_coordinate_csv(csv_path):
+    csv_path = Path(csv_path)
+    if not _is_nonempty_regular_file(csv_path):
+        raise ValueError('missing or empty branch coordinate CSV: {0}'.format(csv_path))
+    try:
+        with csv_path.open('r', encoding='utf-8-sig', newline='') as csv_file:
+            reader = csv.reader(csv_file)
+            row_count = 0
+            for row in reader:
+                if len(row) < 3:
+                    raise ValueError('branch coordinate CSV has an invalid XYZ row')
+                for value in row[:3]:
+                    float(value)
+                row_count += 1
+        if row_count == 0:
+            raise ValueError('branch coordinate CSV has no XYZ data')
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError('could not read branch coordinate CSV: {0}'.format(error))
+
+
+def inspect_centerline_csv_case(case_path):
+    """Return semantic readiness of one case's complete centerline CSV output."""
+
+    case_path = Path(case_path)
+    csv_path = case_path / 'Preproc' / 'CSV'
+    try:
+        if not csv_path.is_dir():
+            raise ValueError('Preproc/CSV folder is missing')
+        for side in CENTERLINE_SIDES:
+            json_path = csv_path / CENTERLINE_JSON_NAME.format(side)
+            centerlines = validate_centerline_json(json_path)
+            _validate_aggregate_centerline_csv(
+                csv_path / CENTERLINE_AGGREGATE_CSV_NAME.format(side)
+            )
+            for branch in centerlines:
+                if not branch['coordinates']:
+                    continue
+                branch_csv_path = csv_path / ('{0}.csv'.format(branch['branch_name']))
+                if not _path_is_within(branch_csv_path, csv_path):
+                    raise ValueError(
+                        'branch CSV path escapes Preproc/CSV: {0}'.format(
+                            branch_csv_path
+                        )
+                    )
+                _validate_branch_coordinate_csv(branch_csv_path)
+        return {'complete': True, 'error_message': ''}
+    except Exception as error:
+        return {
+            'complete': False,
+            'error_message': _clean_error_message(error),
+        }
+
+
+def is_complete_centerline_csv(case_path):
+    return bool(inspect_centerline_csv_case(case_path)['complete'])
+
+
+def _filter_output_file_paths(output_folder, file_name_reference):
+    safe_characters = set(string.ascii_letters + string.digits + '~ -_.')
+    head, tail = ntpath.split(str(file_name_reference))
+    leaf_name = tail or ntpath.basename(head)
+    paths = []
+    for suffix in ('NVl', 'Val'):
+        safe_name = ''.join(
+            character for character in leaf_name + suffix
+            if character in safe_characters
+        )
+        paths.append(Path(output_folder) / (safe_name + '.nii.gz'))
+    return tuple(paths)
+
+
+def _normalized_path_key(path):
+    return os.path.normcase(os.path.realpath(os.path.abspath(str(path))))
+
+
+def _canonical_filter_value(value):
+    if pd.isna(value):
+        raise ValueError('Filter Mask table contains a blank value')
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _load_filter_mask_case_plans(
+        filter_table_path,
+        case_paths,
+        warning_messages=None):
+    """Validate and group one generated FilterMask table by exact case output."""
+
+    filter_table_path = Path(filter_table_path)
+    if not _is_nonempty_regular_file(filter_table_path):
+        raise ValueError(
+            'Filter Mask table is missing or empty: {0}'.format(filter_table_path)
+        )
+    try:
+        dataframe = pd.read_csv(str(filter_table_path))
+    except Exception as error:
+        raise ValueError('Could not read Filter Mask table: {0}'.format(error))
+    missing_columns = [
+        column for column in FILTER_MASK_REQUIRED_COLUMNS
+        if column not in dataframe.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            'Filter Mask table is missing columns: {0}'.format(
+                ', '.join(missing_columns)
+            )
+        )
+
+    case_by_output = {}
+    case_path_by_key = {}
+    plans = {}
+    for case_path_text in case_paths:
+        case_path = Path(case_path_text)
+        case_key = _normalized_path_key(case_path)
+        output_key = _normalized_path_key(
+            case_path / 'Preproc' / 'OriData' / 'Branches'
+        )
+        if output_key in case_by_output:
+            raise ValueError('Duplicate case output folder: {0}'.format(output_key))
+        case_by_output[output_key] = case_key
+        case_path_by_key[case_key] = case_path
+        plans[case_key] = []
+
+    unknown_output_folders = []
+    for row_index, pandas_row in dataframe.iterrows():
+        row = {
+            column: pandas_row[column]
+            for column in FILTER_MASK_REQUIRED_COLUMNS
+        }
+        if pd.isna(row['OutputFolder']):
+            unknown_output_folders.append(
+                'row {0}: <blank>'.format(row_index + 2)
+            )
+            continue
+        output_folder_text = str(row['OutputFolder']).strip()
+        if not output_folder_text:
+            unknown_output_folders.append(
+                'row {0}: <blank>'.format(row_index + 2)
+            )
+            continue
+
+        output_key = _normalized_path_key(output_folder_text)
+        case_key = case_by_output.get(output_key)
+        if case_key is None:
+            unknown_output_folders.append(output_folder_text)
+            continue
+        row['_row_number'] = row_index + 2
+        plans[case_key].append(row)
+
+    if unknown_output_folders:
+        warning = (
+            'Filter Mask ignored rows whose output folders are outside the '
+            'current cases: {0}'.format(
+                ', '.join(sorted(set(unknown_output_folders)))
+            )
+        )
+        if warning_messages is not None:
+            warning_messages.append(warning)
+
+    return plans
+
+
+def _filter_mask_case_fingerprint(case_path, rows):
+    if not rows:
+        raise ValueError('Filter Mask table has no rows for this case')
+    case_path = Path(case_path)
+    canonical_rows = []
+    expected_paths = []
+    expected_path_keys = set()
+    input_hashes = {}
+    for row in rows:
+        row_number = row.get('_row_number', '?')
+        for column in FILTER_MASK_REQUIRED_COLUMNS:
+            if column not in row or pd.isna(row[column]):
+                raise ValueError(
+                    'Filter Mask row {0} has a blank {1}'.format(
+                        row_number, column
+                    )
+                )
+        if (not isinstance(row['FileNameRef'], str)
+                or not row['FileNameRef'].strip()):
+            raise ValueError(
+                'Filter Mask row {0} has an invalid FileNameRef'.format(
+                    row_number
+                )
+            )
+        mask_path = Path(str(row['MaskPath']).strip())
+        if not _path_is_within(mask_path, case_path):
+            raise ValueError(
+                'Filter Mask input is outside case {0}: {1}'.format(
+                    case_path.name, mask_path
+                )
+            )
+        if not _is_nonempty_regular_file(mask_path):
+            raise ValueError(
+                'Filter Mask input is missing or empty: {0}'.format(mask_path)
+            )
+        mask_key = _normalized_path_key(mask_path)
+        if mask_key not in input_hashes:
+            input_hashes[mask_key] = _sha256_file(mask_path)
+        row_expected_paths = _filter_output_file_paths(
+            row['OutputFolder'], row['FileNameRef']
+        )
+        for expected_path in row_expected_paths:
+            if not _path_is_within(expected_path, case_path):
+                raise ValueError(
+                    'Filter Mask output is outside case {0}: {1}'.format(
+                        case_path.name, expected_path
+                    )
+                )
+            expected_key = _normalized_path_key(expected_path)
+            if expected_key in expected_path_keys:
+                raise ValueError(
+                    'Filter Mask rows for {0} produce the same output: {1}'
+                    .format(case_path.name, expected_path)
+                )
+            expected_path_keys.add(expected_key)
+            expected_paths.append(expected_path)
+        canonical_rows.append({
+            'MaskPath': mask_key,
+            'MaskVal': _canonical_filter_value(row['MaskVal']),
+            'NewMaskVal': _canonical_filter_value(row['NewMaskVal']),
+            'OutputFolder': _normalized_path_key(row['OutputFolder']),
+            'FileNameRef': str(row['FileNameRef']),
+        })
+
+    fingerprint_parts = [
+        json.dumps(row, sort_keys=True, separators=(',', ':'))
+        for row in sorted(
+            canonical_rows,
+            key=lambda item: json.dumps(item, sort_keys=True, separators=(',', ':')),
+        )
+    ]
+    fingerprint_parts.extend(
+        'input:{0}:{1}'.format(path_key, input_hashes[path_key])
+        for path_key in sorted(input_hashes)
+    )
+    return _hash_text_parts(fingerprint_parts), expected_paths
+
+
+def _filter_mask_outputs_complete(expected_paths):
+    return all(_is_nonempty_regular_file(path) for path in expected_paths)
+
+
+def _path_is_within(path, parent):
+    """Return whether path resolves inside parent (Python 3.7 compatible)."""
+
+    path = os.path.normcase(os.path.abspath(str(path)))
+    parent = os.path.normcase(os.path.abspath(str(parent)))
+    try:
+        return os.path.commonpath([path, parent]) == parent
+    except ValueError:
+        return False
+
+
+@contextmanager
+def interprocess_file_lock(lock_path, timeout_seconds=LOCK_TIMEOUT_SECONDS):
+    """Hold a one-byte OS lock, released automatically if the process exits."""
+
+    lock_path = Path(lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open('a+b')
+    acquired = False
+    try:
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b'0')
+            lock_file.flush()
+            os.fsync(lock_file.fileno())
+
+        deadline = time.time() + timeout_seconds
+        while True:
+            try:
+                lock_file.seek(0)
+                if os.name == 'nt':
+                    import msvcrt
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (IOError, OSError):
+                if time.time() >= deadline:
+                    raise TimeoutError('Timed out waiting for file lock: {0}'.format(lock_path))
+                time.sleep(LOCK_POLL_SECONDS)
+
+        yield
+    finally:
+        if acquired:
+            try:
+                lock_file.seek(0)
+                if os.name == 'nt':
+                    import msvcrt
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except (IOError, OSError):
+                pass
+        lock_file.close()
+
+
+def _write_csv_atomic(csv_path, fieldnames, rows):
+    """Publish a complete CSV without exposing a partially written file."""
+
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix='.{0}.'.format(csv_path.name),
+        suffix='.tmp',
+        dir=str(csv_path.parent),
+        text=True,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, 'w', encoding='utf-8', newline='') as csv_file:
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=fieldnames,
+                extrasaction='ignore',
+                lineterminator='\n',
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+            csv_file.flush()
+            os.fsync(csv_file.fileno())
+        os.replace(str(temporary_path), str(csv_path))
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _write_dataframe_atomic(dataframe, csv_path):
+    """Atomically publish a pandas DataFrame as a CSV file."""
+
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix='.{0}.'.format(csv_path.name),
+        suffix='.tmp',
+        dir=str(csv_path.parent),
+        text=True,
+    )
+    os.close(file_descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        dataframe.to_csv(str(temporary_path), index=False)
+        os.replace(str(temporary_path), str(csv_path))
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def _read_csv_rows(csv_path):
+    csv_path = Path(csv_path)
+    if not csv_path.is_file() or csv_path.stat().st_size == 0:
+        return [], []
+    with csv_path.open('r', encoding='utf-8-sig', newline='') as csv_file:
+        reader = csv.DictReader(csv_file)
+        return list(reader.fieldnames or []), list(reader)
+
+
+def write_batch_segmentation_records(record_path, records, lock_timeout=LOCK_TIMEOUT_SECONDS):
+    """Atomically write the single, cumulative segmentation ledger for a batch."""
+
+    record_path = Path(record_path)
+    ordered_records = sorted(
+        records,
+        key=lambda row: (str(row.get('batch_name', '')).casefold(),
+                         str(row.get('case_id', '')).casefold()),
+    )
+    with interprocess_file_lock(str(record_path) + '.lock', lock_timeout):
+        _write_csv_atomic(record_path, SEGMENTATION_RECORD_FIELDS, ordered_records)
+    return record_path
+
+
+def merge_batch_segmentation_records(
+        manifest_path,
+        initial_root,
+        lock_timeout=LOCK_TIMEOUT_SECONDS):
+    """Merge every available per-batch ledger into the shared manifest safely."""
+
+    manifest_path = Path(manifest_path)
+    initial_root = Path(initial_root)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with interprocess_file_lock(str(manifest_path) + '.lock', lock_timeout):
+        manifest_fields, manifest_rows = _read_csv_rows(manifest_path)
+        if not manifest_fields:
+            manifest_fields = ['case_id', 'batch_name', 'case_relative_path']
+        else:
+            missing_keys = [
+                field_name
+                for field_name in ('case_id', 'batch_name')
+                if field_name not in manifest_fields
+            ]
+            if missing_keys:
+                raise ValueError(
+                    'Manifest is missing required identity columns {0}: {1}'.format(
+                        ', '.join(missing_keys), manifest_path
+                    )
+                )
+            if 'case_relative_path' not in manifest_fields:
+                manifest_fields.append('case_relative_path')
+        for field_name in SEGMENTATION_STATUS_FIELDS:
+            if field_name not in manifest_fields:
+                manifest_fields.append(field_name)
+
+        row_by_key = {}
+        for row in manifest_rows:
+            key = (str(row.get('batch_name', '')).casefold(),
+                   str(row.get('case_id', '')).casefold())
+            if all(key) and key not in row_by_key:
+                row_by_key[key] = row
+
+        record_paths = sorted(
+            initial_root.glob('batch_*/Table/{0}/{1}'.format(
+                SEGMENTATION_RECORD_FOLDER, SEGMENTATION_RECORD_FILE)),
+            key=lambda path: str(path).casefold(),
+        )
+        merged_record_count = 0
+        for record_path in record_paths:
+            with interprocess_file_lock(str(record_path) + '.lock', lock_timeout):
+                _, batch_records = _read_csv_rows(record_path)
+            for record in batch_records:
+                case_id = str(record.get('case_id', '')).strip()
+                batch_name = str(record.get('batch_name', '')).strip()
+                if not case_id or not batch_name:
+                    continue
+                key = (batch_name.casefold(), case_id.casefold())
+                row = row_by_key.get(key)
+                if row is None:
+                    row = {field_name: '' for field_name in manifest_fields}
+                    row['case_id'] = case_id
+                    row['batch_name'] = batch_name
+                    row['case_relative_path'] = record.get('case_relative_path', '')
+                    manifest_rows.append(row)
+                    row_by_key[key] = row
+                for field_name in SEGMENTATION_STATUS_FIELDS:
+                    row[field_name] = record.get(field_name, '')
+                merged_record_count += 1
+
+        _write_csv_atomic(manifest_path, manifest_fields, manifest_rows)
+
+    return {
+        'manifest_path': manifest_path,
+        'record_count': merged_record_count,
+        'row_count': len(manifest_rows),
+    }
+
 
 class BatchCoronary:
     def __init__(self, UI=None, Hedys=None):
@@ -33,6 +927,12 @@ class BatchCoronary:
             self.ui.MeshExePathBtn_BPP.clicked.connect(lambda: self.ChooseMeshExePath())
             self.ui.ChooseAUIPathBtn_BPP.clicked.connect(lambda: self.ChooseAUIExePath())
             self.ui.ChoosesetPathBtn_BPP.clicked.connect(lambda: self.ChooseSetCsvPath())
+            manifest_button = getattr(self.ui, 'ChooseManifestPathBtn_BPP', None)
+            if manifest_button is not None:
+                manifest_button.clicked.connect(lambda: self.ChooseManifestPath())
+            failed_root_button = getattr(self.ui, 'ChooseFailedRootPathBtn_BPP', None)
+            if failed_root_button is not None:
+                failed_root_button.clicked.connect(lambda: self.ChooseFailedRootPath())
             self.ui.RunBtn_CPP.clicked.connect(lambda: self.mainFunction())
 
         self.modelui = None
@@ -48,6 +948,17 @@ class BatchCoronary:
 
         # create & clean all variables
         self.WorkingDir = None
+        self.ManifestPath = None
+        self.FailedRootPath = None
+        self.InitialSegmentationRoot = None
+        self.BatchName = None
+        self.SegmentationTimeoutSeconds = DEFAULT_SEGMENTATION_TIMEOUT_MINUTES * 60
+        self.BatchSegmentationRecordPath = None
+        self.BranchDictionaryReadyCSVPaths = None
+        self.CenterlineCsvOriginalCasePaths = []
+        self.CenterlineCsvSkipPaths = set()
+        self.CenterlineCsvSourceHashes = {}
+        self.CenterlineJsonStageErrors = {}
         self.DCMDirList = []  # DCM list
         self.CTADirList = []  # store the cta location, include file name
 
@@ -170,9 +1081,10 @@ class BatchCoronary:
     def timmer(func):
         def warpper(self, *args, **kwargs):
             start_time = time.time()
-            func(self)
+            result = func(self, *args, **kwargs)
             stop_time = time.time()
             print('{} run time is {}'.format(func.__name__, stop_time - start_time))
+            return result
 
         return warpper
 
@@ -182,6 +1094,25 @@ class BatchCoronary:
                                                qtObj=True
                                                )
         self.ui.LoadFolderPath_Txt_BPP.setPlainText(dirname)
+
+    def ChooseManifestPath(self):
+        filename = Save_Load_File.SaveFilePathQT(
+            dispMsg='Choose or create segmentation manifest CSV',
+            fileTypes='CSV files (*.csv);;All files (*.*)',
+            fileObj=self.ui,
+            qtObj=True,
+        )
+        if filename:
+            self.ui.ManifestPath_Txt_BPP.setPlainText(filename)
+
+    def ChooseFailedRootPath(self):
+        dirname = Save_Load_File.OpenDirPathQt(
+            dispMsg='Choose failed segmentation output root',
+            fileObj=self.ui,
+            qtObj=True,
+        )
+        if dirname:
+            self.ui.FailedRootPath_Txt_BPP.setPlainText(dirname)
 
     # used to choose CG exe path
     def ChooseCGExePath(self):
@@ -333,8 +1264,11 @@ class BatchCoronary:
                     self.DCMDirList.append(root)
                     break
 
+        self.DCMDirList.sort(key=lambda path: os.path.normcase(os.path.abspath(path)))
         # CTA path creation
-        self.CTADirList = [os.path.join(x, 'CTA\CTA.nii.gz') for x in self.DCMDirList]
+        self.CTADirList = [
+            os.path.join(x, 'CTA', 'CTA.nii.gz') for x in self.DCMDirList
+        ]
 
     def CreateFoldersDCM(self):
         # create necessary folders under all folders
@@ -402,8 +1336,23 @@ class BatchCoronary:
         self.CreateSingleFolder(FFRPostProcessingPath)
         self.CreateSingleFolder(IFRPostProcessingPath)
 
+    def ResetCasePathLists(self):
+        """Clear lists derived from DCMDirList so they can be rebuilt safely."""
+
+        for attribute_name in (
+                'CTANewFilePathList', 'CTANewPathList', 'CTAPathList',
+                'XsecFixCTAPathList', 'OriVolCTAPathList', 'leftCenterlineJsonList',
+                'rightCenterlineJsonList', 'OriDataPathList', 'CSVPathList',
+                'BranchPathList', 'AortaPathList', 'AortaFixedPathList',
+                'NewAortaPathList', 'XsectionPathList', 'XsectionFixPathList',
+                'XsectionFixExtPathList', 'OriVolumePathList', 'FinalMaskPathList',
+                'StlFilePathList', 'ArVolCalPathList', 'STLFolderList',
+                'MeshFolderList', 'MeshFilePathList'):
+            setattr(self, attribute_name, [])
+
     # store the required path information as list
     def StoreListInformation(self):
+        self.ResetCasePathLists()
         for path in self.DCMDirList:
             self.OriDataPathList.append(os.path.join(path, 'Preproc/OriData'))
             self.CSVPathList.append(os.path.join(path, 'Preproc/CSV'))
@@ -418,10 +1367,14 @@ class BatchCoronary:
             pass
 
         # copy centerline JSON files update 13Mar24
-        self.leftCenterlineJsonList = [z.replace('OriData', 'CSV/L_coronary_centerline_network.json') for z in
-                                       self.OriDataPathList]
-        self.rightCenterlineJsonList = [z.replace('OriData', 'CSV/R_coronary_centerline_network.json') for z in
-                                        self.OriDataPathList]
+        self.leftCenterlineJsonList = [
+            os.path.join(path, CENTERLINE_JSON_NAME.format('L'))
+            for path in self.CSVPathList
+        ]
+        self.rightCenterlineJsonList = [
+            os.path.join(path, CENTERLINE_JSON_NAME.format('R'))
+            for path in self.CSVPathList
+        ]
 
         # store the final mask path using orivolume path list
         self.FinalMaskPathList = [os.path.join(x, 'OriVolumeCAVal.nii.gz') for x in self.OriVolumePathList]
@@ -506,6 +1459,440 @@ class BatchCoronary:
     def BatchDCM2Nifti(self):
         self.model.convertDataType.BatchDICOMconvertNIFTI(tablePath=self.BatchDCMTablePath, refImg=False)
 
+    def _load_batch_segmentation_records(self):
+        self._ensure_batch_segmentation_record_path()
+        record_path = Path(self.BatchSegmentationRecordPath)
+        with interprocess_file_lock(str(record_path) + '.lock'):
+            _, records = _read_csv_rows(record_path)
+        return {
+            (str(record.get('batch_name', '')).casefold(),
+             str(record.get('case_id', '')).casefold()): record
+            for record in records
+            if record.get('batch_name') and record.get('case_id')
+        }
+
+    def _save_batch_segmentation_record_map(self, record_map):
+        self._ensure_batch_segmentation_record_path()
+        return write_batch_segmentation_records(
+            self.BatchSegmentationRecordPath,
+            list(record_map.values()),
+        )
+
+    def _ensure_batch_segmentation_record_path(self):
+        if not self.TableDir:
+            if not self.WorkingDir:
+                raise ValueError('Working directory is required for the batch ledger')
+            self.TableDir = os.path.join(self.WorkingDir, 'Table')
+        record_folder = Path(self.TableDir) / SEGMENTATION_RECORD_FOLDER
+        record_folder.mkdir(parents=True, exist_ok=True)
+        expected_path = record_folder / SEGMENTATION_RECORD_FILE
+        if not self.BatchSegmentationRecordPath:
+            self.BatchSegmentationRecordPath = str(expected_path)
+        return Path(self.BatchSegmentationRecordPath)
+
+    def _ensure_case_record(self, record_map, case_path):
+        case_path = Path(case_path)
+        key = (self.BatchName.casefold(), case_path.name.casefold())
+        record = record_map.get(key)
+        if record is None:
+            source_path = case_path / 'Preproc' / 'OriData' / 'CTA.nii.gz'
+            try:
+                source_sha256 = _sha256_file(source_path)
+            except Exception:
+                source_sha256 = ''
+            record = {
+                'case_id': case_path.name,
+                'batch_name': self.BatchName,
+                'case_relative_path': '{0}/{1}'.format(
+                    self.BatchName, case_path.name
+                ),
+                'source_sha256': source_sha256,
+                'centerline_json_source_sha256': '',
+                'filter_mask_input_sha256': '',
+            }
+            record.update(SEGMENTATION_STATUS_DEFAULTS)
+            record['complete_segmentation'] = int(
+                is_complete_segmentation(case_path)
+            )
+            record_map[key] = record
+        else:
+            record.setdefault('centerline_json_source_sha256', '')
+            record.setdefault('filter_mask_input_sha256', '')
+            for field_name, default_value in SEGMENTATION_STATUS_DEFAULTS.items():
+                record.setdefault(field_name, default_value)
+        return record
+
+    @staticmethod
+    def _append_record_error(record, error_field, message):
+        messages = [record.get(error_field, ''), message]
+        record[error_field] = _clean_error_message(
+            '; '.join(item for item in messages if item)
+        )
+
+    @staticmethod
+    def _append_segmentation_record_error(record, message):
+        BatchCoronary._append_record_error(record, 'seg_exe_er_msg', message)
+
+    def _move_failed_cases(
+            self,
+            failed_cases,
+            record_map,
+            error_field,
+            stage_label):
+        failed_batch_path = (
+            Path(self.FailedRootPath)
+            / FAILED_SEGMENTATION_FOLDER_NAME
+            / self.BatchName
+        )
+        records_changed = False
+
+        seen_case_paths = set()
+        for case_path in failed_cases:
+            case_path = Path(case_path)
+            case_path_key = _normalized_path_key(case_path)
+            if case_path_key in seen_case_paths:
+                continue
+            seen_case_paths.add(case_path_key)
+            key = (self.BatchName.casefold(), case_path.name.casefold())
+            record = self._ensure_case_record(record_map, case_path)
+            destination = failed_batch_path / case_path.name
+            try:
+                if not _path_is_within(case_path, self.WorkingDir):
+                    raise ValueError('Refusing to move a case outside the working batch')
+                if _path_is_within(failed_batch_path, self.WorkingDir):
+                    raise ValueError(
+                        'Failed-case destination cannot be inside the working batch'
+                    )
+                if _path_is_within(destination, case_path):
+                    raise ValueError('Failed-case destination cannot be inside the case folder')
+                if destination.exists():
+                    collision_suffix = datetime.now().strftime('%Y%m%d%H%M%S%f')
+                    alternate_name = '{0}__retry_{1}_{2}'.format(
+                        case_path.name, collision_suffix, os.getpid()
+                    )
+                    destination = failed_batch_path / alternate_name
+                    counter = 1
+                    while destination.exists():
+                        destination = failed_batch_path / '{0}_{1}'.format(
+                            alternate_name, counter
+                        )
+                        counter += 1
+                    self._append_record_error(
+                        record,
+                        error_field,
+                        'Existing failed case was preserved; moved this failure to {0}'.format(
+                            destination
+                        ),
+                    )
+                    records_changed = True
+                failed_batch_path.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(case_path), str(destination))
+                self.UpdateMsgLog(
+                    'Moved failed {0} case {1} to {2}'.format(
+                        stage_label, case_path.name, destination
+                    )
+                )
+            except Exception as error:
+                self._append_record_error(
+                    record,
+                    error_field,
+                    'Failed to move case: {0}'.format(error),
+                )
+                records_changed = True
+                self.UpdateMsgLog(
+                    'Could not move failed {0} case {1}: {2}'.format(
+                        stage_label, case_path.name, error
+                    )
+                )
+
+        if records_changed:
+            self._save_batch_segmentation_record_map(record_map)
+
+    def _move_failed_segmentation_cases(self, failed_cases, record_map):
+        return self._move_failed_cases(
+            failed_cases,
+            record_map,
+            'seg_exe_er_msg',
+            'segmentation',
+        )
+
+    def _run_tracked_segmentation(self, safe_runner):
+        """Run every discovered case independently and persist each result."""
+
+        record_path = self._ensure_batch_segmentation_record_path()
+        record_folder = record_path.parent
+
+        # Reconcile records left by an interrupted earlier run before starting.
+        try:
+            merge_batch_segmentation_records(
+                self.ManifestPath,
+                self.InitialSegmentationRoot,
+            )
+        except Exception as error:
+            self.UpdateMsgLog(
+                'Manifest reconciliation warning; batch processing will continue: {0}'.format(
+                    error
+                )
+            )
+
+        failed_batch_path = (
+            Path(self.FailedRootPath)
+            / FAILED_SEGMENTATION_FOLDER_NAME
+            / self.BatchName
+        )
+        if _path_is_within(failed_batch_path, self.WorkingDir):
+            raise ValueError(
+                'Failed segmentation output must be outside the working batch: {0}'.format(
+                    failed_batch_path
+                )
+            )
+        for case_path in self.DCMDirList:
+            if (os.path.normcase(os.path.abspath(case_path))
+                    == os.path.normcase(os.path.abspath(self.WorkingDir))):
+                raise ValueError(
+                    'The working batch itself cannot be processed as a case: {0}'.format(
+                        self.WorkingDir
+                    )
+                )
+
+        run_lock_path = record_folder / (SEGMENTATION_RECORD_FILE + '.run.lock')
+        with interprocess_file_lock(run_lock_path, timeout_seconds=1):
+            record_map = self._load_batch_segmentation_records()
+            case_paths = list(self.DCMDirList)
+            complete_case_paths = []
+            failed_case_paths = []
+            current_records = []
+            skipped_count = 0
+            executed_count = 0
+
+            def segmentation_progress():
+                processed_count = len(complete_case_paths) + len(failed_case_paths)
+                return (
+                    'Batch progress: completed {0}, failed {1}, processed {2}/{3}.'
+                    .format(
+                        len(complete_case_paths),
+                        len(failed_case_paths),
+                        processed_count,
+                        len(case_paths),
+                    )
+                )
+
+            for case_path_text in case_paths:
+                case_path = Path(case_path_text)
+                case_id = case_path.name
+                key = (self.BatchName.casefold(), case_id.casefold())
+                case_relative_path = '{0}/{1}'.format(self.BatchName, case_id)
+                previous_record = record_map.get(key)
+                if previous_record is not None:
+                    previous_record = self._ensure_case_record(
+                        record_map, case_path
+                    )
+                source_cta_path = case_path / 'Preproc' / 'OriData' / 'CTA.nii.gz'
+                source_sha256 = ''
+                source_hash_error = ''
+                try:
+                    source_sha256 = _sha256_file(source_cta_path)
+                except Exception as error:
+                    source_hash_error = 'Could not fingerprint input CTA: {0}'.format(
+                        error
+                    )
+
+                if (previous_record is not None
+                        and str(previous_record.get('complete_segmentation', '')) == '1'
+                        and str(previous_record.get('seg_exe_failed', '')) == '0'
+                        and source_sha256
+                        and previous_record.get('source_sha256', '') == source_sha256
+                        and is_complete_segmentation(case_path)):
+                    skipped_count += 1
+                    complete_case_paths.append(str(case_path))
+                    current_records.append(previous_record)
+                    self.UpdateMsgLog(
+                        'Skip completed segmentation case: {0}\n{1}'.format(
+                            case_id, segmentation_progress()
+                        )
+                    )
+                    continue
+
+                executed_count += 1
+                record = {
+                    'case_id': case_id,
+                    'batch_name': self.BatchName,
+                    'case_relative_path': case_relative_path,
+                    'source_sha256': source_sha256,
+                    'centerline_json_source_sha256': '',
+                    'filter_mask_input_sha256': '',
+                }
+                record.update(SEGMENTATION_STATUS_DEFAULTS)
+                record.update({
+                    'run_segmentation': 1,
+                    'seg_exe_failed': 1,
+                    'seg_exe_er_msg': 'Segmentation started but did not finish.',
+                    'coronary_segment_failed': 1,
+                    'complete_segmentation': 0,
+                })
+                record_map[key] = record
+                self._save_batch_segmentation_record_map(record_map)
+                self.UpdateMsgLog('Segmentation start: {0}'.format(case_id))
+
+                if source_hash_error:
+                    record['seg_exe_er_msg'] = _clean_error_message(
+                        source_hash_error
+                    )
+                    self._save_batch_segmentation_record_map(record_map)
+                    current_records.append(record)
+                    failed_case_paths.append(str(case_path))
+                    self.UpdateMsgLog(
+                        'Invalid CTA input; continuing to next case: {0}\n{1}'.format(
+                            case_id, segmentation_progress()
+                        )
+                    )
+                    continue
+
+                if (not self.CGEXEPath
+                        or not Path(self.CGEXEPath).is_file()):
+                    record['seg_exe_er_msg'] = _clean_error_message(
+                        'Centerline generation executable does not exist: {0}'
+                        .format(self.CGEXEPath)
+                    )
+                    self._save_batch_segmentation_record_map(record_map)
+                    current_records.append(record)
+                    failed_case_paths.append(str(case_path))
+                    self.UpdateMsgLog(
+                        'Segmentation executable unavailable; continuing to '
+                        'next case: {0}\n{1}'.format(
+                            case_id, segmentation_progress()
+                        )
+                    )
+                    continue
+
+                mask_path = case_path / SEGMENTATION_MASK_RELATIVE_PATH
+                stale_mask_path = None
+                try:
+                    if mask_path.exists():
+                        if not mask_path.is_file():
+                            raise ValueError(
+                                'Existing segmentation output is not a file: {0}'.format(
+                                    mask_path
+                                )
+                            )
+                        stale_mask_path = mask_path.with_name(
+                            '{0}.pre_run_{1}_{2}'.format(
+                                mask_path.name,
+                                os.getpid(),
+                                datetime.now().strftime('%Y%m%d%H%M%S%f'),
+                            )
+                        )
+                        os.replace(str(mask_path), str(stale_mask_path))
+                except Exception as error:
+                    record['seg_exe_er_msg'] = _clean_error_message(
+                        'Could not preserve existing segmentation before rerun: {0}'.format(
+                            error
+                        )
+                    )
+                    self._save_batch_segmentation_record_map(record_map)
+                    current_records.append(record)
+                    failed_case_paths.append(str(case_path))
+                    self.UpdateMsgLog(
+                        'Segmentation preparation failed; continuing to next case: '
+                        '{0}\n{1}'.format(
+                            case_id, segmentation_progress()
+                        )
+                    )
+                    continue
+
+                try:
+                    result = safe_runner(
+                        destination=str(case_path / 'Preproc' / 'OriData'),
+                        exe_path=self.CGEXEPath,
+                        timeout_seconds=self.SegmentationTimeoutSeconds,
+                        output_limit=MAX_SEGMENTATION_ERROR_LENGTH,
+                    )
+                    mask_complete = is_complete_segmentation(case_path)
+                    exe_failed = bool(result.get('exe_failed', True))
+                    complete = mask_complete and not exe_failed
+                    record['seg_exe_failed'] = int(exe_failed)
+                    record['seg_exe_er_msg'] = _clean_error_message(
+                        result.get('error_message', '')
+                    )
+                    record['coronary_segment_failed'] = int(not complete)
+                    record['complete_segmentation'] = int(complete)
+                    if not mask_complete and not record['seg_exe_er_msg']:
+                        record['seg_exe_er_msg'] = (
+                            'sc_labelled_coronary_segment.nii.gz is missing or empty.'
+                        )
+                    elif exe_failed and not record['seg_exe_er_msg']:
+                        record['seg_exe_er_msg'] = (
+                            'Segmentation executable reported a failed stage.'
+                        )
+                except Exception as error:
+                    record['seg_exe_failed'] = 1
+                    record['seg_exe_er_msg'] = _clean_error_message(
+                        'Unexpected segmentation runner error: {0}'.format(error)
+                    )
+                    record['coronary_segment_failed'] = 1
+                    record['complete_segmentation'] = 0
+
+                if record['complete_segmentation'] == 1 and stale_mask_path is not None:
+                    try:
+                        stale_mask_path.unlink()
+                    except OSError as error:
+                        self._append_segmentation_record_error(
+                            record,
+                            'Could not remove preserved old segmentation: {0}'.format(
+                                error
+                            ),
+                        )
+
+                self._save_batch_segmentation_record_map(record_map)
+                current_records.append(record)
+                if record['complete_segmentation'] == 1:
+                    complete_case_paths.append(str(case_path))
+                    outcome_message = 'Segmentation complete: {0}'.format(case_id)
+                else:
+                    failed_case_paths.append(str(case_path))
+                    outcome_message = (
+                        'Segmentation failed; continuing to next case: {0}'.format(
+                            case_id
+                        )
+                    )
+                self.UpdateMsgLog(
+                    '{0}\n{1}'.format(outcome_message, segmentation_progress())
+                )
+
+            self.UpdateMsgLog(
+                'Segmentation resume summary: skipped {0}, executed {1}, '
+                'completed {2}, failed {3}, total {4}.'.format(
+                    skipped_count,
+                    executed_count,
+                    len(complete_case_paths),
+                    len(failed_case_paths),
+                    len(case_paths),
+                )
+            )
+
+            # Moving happens only after every case in the fixed snapshot was attempted.
+            self._move_failed_segmentation_cases(failed_case_paths, record_map)
+            # Also upgrades legacy ledgers when every case was resume-skipped.
+            self._save_batch_segmentation_record_map(record_map)
+            self.DCMDirList = complete_case_paths
+            self.CTADirList = [
+                os.path.join(case_path, 'CTA', 'CTA.nii.gz')
+                for case_path in self.DCMDirList
+            ]
+            self.StoreListInformation()
+            try:
+                merge_batch_segmentation_records(
+                    self.ManifestPath,
+                    self.InitialSegmentationRoot,
+                )
+            except Exception as error:
+                self.UpdateMsgLog(
+                    'Manifest merge warning; batch record is preserved at {0}: {1}'.format(
+                        self.BatchSegmentationRecordPath, error
+                    )
+                )
+            return current_records
+
     # Move CTA file to specified folder, then generate centerline and mask
     def BatchCenterlineGen(self):
         df = pd.DataFrame(data=self.OriDataPathList, columns=['FolderPath'])
@@ -513,52 +1900,233 @@ class BatchCoronary:
         BatchCCTablePath = os.path.join(self.TableDir, 'BatchCenterlineGeneration.csv')
         df.to_csv(BatchCCTablePath, index=False)
 
-        self.model.CenterlineGeneration.InitCenterlineEx(exePath=self.CGEXEPath, TablePath=BatchCCTablePath)
+        safe_runner = getattr(
+            self.model.CenterlineGeneration,
+            'run_case_safely',
+            None,
+        )
+        if callable(safe_runner):
+            return self._run_tracked_segmentation(safe_runner)
+
+        # Compatibility fallback for older injected CenterlineGeneration objects.
+        self.model.CenterlineGeneration.InitCenterlineEx(
+            exePath=self.CGEXEPath,
+            TablePath=BatchCCTablePath,
+        )
         self.model.CenterlineGeneration.BatchViaExcel()
+        return None
+
+    def BeginCenterlineCsvRun(self):
+        """Select only cases whose complete centerline CSV outputs need repair."""
+
+        self.CenterlineCsvOriginalCasePaths = list(self.DCMDirList)
+        self.CenterlineCsvSkipPaths = set()
+        self.CenterlineCsvSourceHashes = {}
+        self.CenterlineJsonStageErrors = {}
+        record_map = self._load_batch_segmentation_records()
+        rerun_case_paths = []
+
+        for case_path_text in self.CenterlineCsvOriginalCasePaths:
+            case_path = Path(case_path_text)
+            case_key = _normalized_path_key(case_path)
+            record = self._ensure_case_record(record_map, case_path)
+            fingerprint = ''
+            try:
+                fingerprint, _resolved = centerline_json_source_fingerprint(
+                    case_path
+                )
+                self.CenterlineCsvSourceHashes[case_key] = fingerprint
+            except Exception as error:
+                self.CenterlineJsonStageErrors[case_key] = _clean_error_message(
+                    error
+                )
+
+            can_resume = (
+                str(record.get('complete_centerline_csv', '')) == '1'
+                and str(record.get('centerline_csv_failed', '')) == '0'
+                and bool(fingerprint)
+                and record.get('centerline_json_source_sha256', '') == fingerprint
+                and is_complete_centerline_csv(case_path)
+            )
+            if can_resume:
+                self.CenterlineCsvSkipPaths.add(case_key)
+                self.UpdateMsgLog(
+                    'Skip completed centerline CSV case: {0}'.format(
+                        case_path.name
+                    )
+                )
+            else:
+                rerun_case_paths.append(str(case_path))
+
+        if self.CenterlineCsvOriginalCasePaths:
+            self._save_batch_segmentation_record_map(record_map)
+        self.DCMDirList = rerun_case_paths
+        self.CTADirList = [
+            os.path.join(case_path, 'CTA', 'CTA.nii.gz')
+            for case_path in rerun_case_paths
+        ]
+        self.StoreListInformation()
+        self.UpdateMsgLog(
+            'Centerline CSV resume summary: skipped {0}, rerun {1}, total {2}.'
+            .format(
+                len(self.CenterlineCsvSkipPaths),
+                len(rerun_case_paths),
+                len(self.CenterlineCsvOriginalCasePaths),
+            )
+        )
+        return {
+            'skipped': len(self.CenterlineCsvSkipPaths),
+            'rerun': len(rerun_case_paths),
+            'total': len(self.CenterlineCsvOriginalCasePaths),
+        }
+
+    def FinalizeCenterlineCsvRun(self):
+        """Validate every fixed-snapshot case, record it, then move failures."""
+
+        original_case_paths = list(self.CenterlineCsvOriginalCasePaths)
+        if not original_case_paths:
+            original_case_paths = list(self.DCMDirList)
+        record_map = self._load_batch_segmentation_records()
+        ready_case_paths = []
+        failed_case_paths = []
+        outcomes = {}
+
+        for checked_count, case_path_text in enumerate(original_case_paths, 1):
+            case_path = Path(case_path_text)
+            case_key = _normalized_path_key(case_path)
+            record = self._ensure_case_record(record_map, case_path)
+            errors = []
+            fingerprint = self.CenterlineCsvSourceHashes.get(case_key, '')
+            try:
+                current_fingerprint, _resolved = (
+                    centerline_json_source_fingerprint(case_path)
+                )
+                if fingerprint and current_fingerprint != fingerprint:
+                    errors.append(
+                        'Centerline JSON source changed during processing.'
+                    )
+                fingerprint = current_fingerprint
+            except Exception as error:
+                errors.append(str(error))
+
+            stage_error = self.CenterlineJsonStageErrors.get(case_key, '')
+            if stage_error:
+                errors.append(stage_error)
+            inspection = inspect_centerline_csv_case(case_path)
+            if not inspection['complete']:
+                errors.append(inspection['error_message'])
+
+            error_message = _clean_error_message(
+                '; '.join(dict.fromkeys(error for error in errors if error))
+            )
+            complete = not bool(error_message)
+            record['run_centerline_csv_check'] = 1
+            record['centerline_csv_failed'] = int(not complete)
+            record['centerline_csv_er_msg'] = error_message
+            record['complete_centerline_csv'] = int(complete)
+            record['centerline_json_source_sha256'] = fingerprint
+
+            if case_key not in self.CenterlineCsvSkipPaths:
+                record['run_filter_mask'] = 0
+                record['filter_mask_failed'] = 0
+                record['filter_mask_er_msg'] = ''
+                record['complete_filter_mask'] = 0
+                record['filter_mask_input_sha256'] = ''
+
+            if complete:
+                ready_case_paths.append(str(case_path))
+            else:
+                failed_case_paths.append(str(case_path))
+            outcomes[str(case_path)] = {
+                'complete': complete,
+                'error_message': error_message,
+                'source_sha256': fingerprint,
+            }
+            self._save_batch_segmentation_record_map(record_map)
+            self.UpdateMsgLog(
+                'CSV safeguard: ready {0}, failed {1}, checked {2}/{3}.'.format(
+                    len(ready_case_paths),
+                    len(failed_case_paths),
+                    checked_count,
+                    len(original_case_paths),
+                )
+            )
+
+        # Moving happens only after every case in the fixed snapshot was checked.
+        # If a multi-case batch has zero successful cases, hold every folder in
+        # place.  A unanimous failure is much more likely to be a shared input,
+        # configuration, or software problem than independent bad cases.
+        hold_entire_batch = (
+            len(original_case_paths) > 1
+            and not ready_case_paths
+            and len(failed_case_paths) == len(original_case_paths)
+        )
+        if hold_entire_batch:
+            self.UpdateMsgLog(
+                'SAFETY STOP: all {0} cases failed the centerline CSV '
+                'safeguard. No case folders were moved; review the recorded '
+                'errors before retrying.'.format(len(original_case_paths))
+            )
+        else:
+            self._move_failed_cases(
+                failed_case_paths,
+                record_map,
+                'centerline_csv_er_msg',
+                'centerline CSV',
+            )
+        self.DCMDirList = ready_case_paths
+        self.CTADirList = [
+            os.path.join(case_path, 'CTA', 'CTA.nii.gz')
+            for case_path in ready_case_paths
+        ]
+        self.StoreListInformation()
+        try:
+            merge_batch_segmentation_records(
+                self.ManifestPath,
+                self.InitialSegmentationRoot,
+            )
+        except Exception as error:
+            self.UpdateMsgLog(
+                'Manifest merge warning after CSV safeguard; batch record is '
+                'preserved at {0}: {1}'.format(
+                    self.BatchSegmentationRecordPath, error
+                )
+            )
+        return outcomes
 
     # copy centerline json file to specified folder
     @timmer
     def CopyCenterlineJson(self):
-        leftOldList = [os.path.join(self.OriDataPathList[i], 'L_coronary_centerline_network.json') for i in
-                       range(len(self.OriDataPathList))]
-        rightOldList = [os.path.join(self.OriDataPathList[i], 'R_coronary_centerline_network.json') for i in
-                        range(len(self.OriDataPathList))]
-        leftOldListT = [os.path.join(self.OriDataPathList[i], 'L_coronary_centerline_network.json.txt') for i in
-                        range(len(self.OriDataPathList))]
-        rightOldListT = [os.path.join(self.OriDataPathList[i], 'R_coronary_centerline_network.json.txt') for i in
-                         range(len(self.OriDataPathList))]
-
-        leftList = [z.replace('OriData', 'CSV') for z in self.OriDataPathList]
-        rightList = [z.replace('OriData', 'CSV') for z in self.OriDataPathList]
-
-        # new json file positions disabled JZ 13Mar24
-        # self.leftCenterlineJsonList = [os.path.join(path, 'L_coronary_centerline_network.json') for path in leftList]
-        # self.rightCenterlineJsonList = [os.path.join(path, 'R_coronary_centerline_network.json') for path in rightList]
-
-        for i in range(len(self.OriDataPathList)):
+        results = {}
+        for case_path_text in list(self.DCMDirList):
+            case_path = Path(case_path_text)
+            case_key = _normalized_path_key(case_path)
             try:
-                cmd1 = self.CopyCommand(leftOldList[i], leftList[i])
-                print(cmd1)
-            except:
-                print("!!!FAIL copy: \n{} \n{}".format(leftOldList[i], leftList[i]))
-
-            try:
-                cmd2 = self.CopyCommand(rightOldList[i], rightList[i])
-                print(cmd2)
-            except:
-                print("!!!FAIL copy: \n{} \n{}".format(rightOldList[i], rightList[i]))
-
-            try:
-                cmd3 = self.CopyCommand(leftOldListT[i], leftList[i])
-                print(cmd3)
-            except:
-                print("!!!FAIL copy: \n{} \n{}".format(leftOldListT[i], leftList[i]))
-
-            try:
-                cmd4 = self.CopyCommand(rightOldListT[i], rightList[i])
-                print(cmd4)
-            except:
-                print("!!!FAIL copy: \n{} \n{}".format(rightOldListT[i], rightList[i]))
+                fingerprint = stage_centerline_json_pair(case_path)
+                self.CenterlineCsvSourceHashes[case_key] = fingerprint
+                self.CenterlineJsonStageErrors.pop(case_key, None)
+                results[str(case_path)] = {
+                    'complete': True,
+                    'source_sha256': fingerprint,
+                    'error_message': '',
+                }
+                self.UpdateMsgLog(
+                    'Centerline JSON staged: {0}'.format(case_path.name)
+                )
+            except Exception as error:
+                error_message = _clean_error_message(error)
+                self.CenterlineJsonStageErrors[case_key] = error_message
+                results[str(case_path)] = {
+                    'complete': False,
+                    'source_sha256': '',
+                    'error_message': error_message,
+                }
+                self.UpdateMsgLog(
+                    'Centerline JSON staging failed; continuing: {0}: {1}'.format(
+                        case_path.name, error_message
+                    )
+                )
+        return results
 
     # copy cta file from cta folder to branches folder
     def CopyCTA(self):
@@ -604,7 +2172,10 @@ class BatchCoronary:
         # self.AortaPathList = [os.path.join(x, 'AortaVal.nii.gz') for x in self.BranchPathList]
         # self.NewAortaPathList = [x.replace('OriData/Branches', 'OriVolume') for x in self.AortaPathList]
         self.AortaPathList = [os.path.join(x, 'AortaFixVal.nii.gz') for x in self.XsecFixCTAPathList]
-        self.AortaPathList = [x.replace('XsectionFixExt\CTA.nii.gz', 'XsectionFix') for x in self.AortaPathList]
+        self.AortaPathList = [
+            x.replace(r'XsectionFixExt\CTA.nii.gz', 'XsectionFix')
+            for x in self.AortaPathList
+        ]
         self.NewAortaPathList = [x.replace('XsectionFix', 'OriVolume') for x in self.AortaPathList]
         print(self.AortaPathList)
         print(self.NewAortaPathList)
@@ -618,7 +2189,14 @@ class BatchCoronary:
     def BatchExtractCenterline(self):
         for dir in self.CSVPathList:
             print("Extract centerline in: {}".format(dir))
-            self.model.CenterlineExtraction.BatchCenterlineProcessing(dir=dir)
+            try:
+                self.model.CenterlineExtraction.BatchCenterlineProcessing(dir=dir)
+            except Exception as error:
+                self.UpdateMsgLog(
+                    'Centerline extraction failed; continuing: {0}: {1}'.format(
+                        dir, error
+                    )
+                )
 
     # generate table used for batch Jason update
     def GenerateJsonUpdateTable(self):
@@ -659,7 +2237,34 @@ class BatchCoronary:
 
     # Batch Jason Update
     def BatchJsonUpdate(self):
-        self.model.CenterlineJSONUpdate.BatchUpdateJson(tablePath=self.JasonUpdateTablePath)
+        update_one = getattr(
+            self.model.CenterlineJSONUpdate,
+            'UpdateCenterlineJson',
+            None,
+        )
+        if not callable(update_one):
+            self.model.CenterlineJSONUpdate.BatchUpdateJson(
+                tablePath=self.JasonUpdateTablePath
+            )
+            return
+
+        update_table = Pd_Funs.OpenDF(self.JasonUpdateTablePath, header=0)
+        for csv_directory, json_file, update_type in zip(
+                update_table['CSVDirectory'].tolist(),
+                update_table['JsonFile'].tolist(),
+                update_table['UpdateType'].tolist()):
+            try:
+                update_one(
+                    jsonFile=json_file,
+                    CSVDir=csv_directory,
+                    updateType=update_type,
+                )
+            except Exception as error:
+                self.UpdateMsgLog(
+                    'Centerline JSON update failed; continuing: {0}: {1}'.format(
+                        json_file, error
+                    )
+                )
 
     # input path, join path with json file, return a list include l and r json file path
     @staticmethod
@@ -675,6 +2280,7 @@ class BatchCoronary:
     # write branch processing dictionary
     def CheckWriteDict(self):
         # input list
+        self.BranchDictionaryReadyCSVPaths = set()
         branchLst = []
         if self.ui.LM_CB_CPP.isChecked(): branchLst.append("LM")
         if self.ui.IMB_CB_CPP.isChecked(): branchLst.append("IMB")
@@ -709,13 +2315,158 @@ class BatchCoronary:
             # validate which branch can be used for each case
             tempJsonList = self.ReturnJsonList(CSVPath)
             UseJsonPath = os.path.join(CSVPath, 'coronarySegmentsUse.json')
-            BranchDictionary.ValidateUse(dicPath=self.DictionaryPath,
-                                         jsonList=tempJsonList,
-                                         outputPath=UseJsonPath,
-                                         ignoreCoordsLst=ignoreCoordsLst)
+            try:
+                BranchDictionary.ValidateUse(dicPath=self.DictionaryPath,
+                                             jsonList=tempJsonList,
+                                             outputPath=UseJsonPath,
+                                             ignoreCoordsLst=ignoreCoordsLst)
+                self.BranchDictionaryReadyCSVPaths.add(
+                    os.path.normcase(os.path.abspath(CSVPath))
+                )
+            except Exception as error:
+                self.UpdateMsgLog(
+                    'Branch dictionary failed; continuing: {0}: {1}'.format(
+                        CSVPath, error
+                    )
+                )
+
+    def RetainTableReadyCases(self):
+        """Keep only cases with a valid branch-use JSON before table generation."""
+
+        ready_case_paths = []
+        for case_path, csv_path, area_volume_path in zip(
+                self.DCMDirList, self.CSVPathList, self.ArVolCalPathList):
+            use_json_path = Path(csv_path) / 'coronarySegmentsUse.json'
+            try:
+                if (self.BranchDictionaryReadyCSVPaths is not None
+                        and os.path.normcase(os.path.abspath(csv_path))
+                        not in self.BranchDictionaryReadyCSVPaths):
+                    raise ValueError('branch dictionary was not generated in this run')
+                if not use_json_path.is_file() or use_json_path.stat().st_size == 0:
+                    raise FileNotFoundError('missing or empty coronarySegmentsUse.json')
+                with use_json_path.open('r') as json_file:
+                    case_dictionary = json.load(json_file)
+                if not isinstance(case_dictionary, list):
+                    raise ValueError('coronarySegmentsUse.json must contain a list')
+                required_branch_fields = {
+                    'use', 'original_volume_mask_fix', 'label',
+                    'original_branch', 'original_csv',
+                    'cross_section_image_LI', '3D_csv',
+                    'cross_section_mask_NN', 'cross_section_mask_fix',
+                    'cross_section_mask_fix_extension', 'branch_name',
+                    'branch_label',
+                }
+                for branch_index, branch in enumerate(case_dictionary):
+                    if not isinstance(branch, dict):
+                        raise ValueError(
+                            'branch {0} must be a dictionary'.format(branch_index)
+                        )
+                    if 'use' not in branch:
+                        raise ValueError(
+                            'branch {0} is missing use'.format(branch_index)
+                        )
+                    if not branch['use']:
+                        continue
+                    missing_fields = sorted(required_branch_fields.difference(branch))
+                    if missing_fields:
+                        raise ValueError(
+                            'branch {0} is missing fields: {1}'.format(
+                                branch_index, ', '.join(missing_fields)
+                            )
+                        )
+                    if not isinstance(branch['label'], list) or not branch['label']:
+                        raise ValueError(
+                            'branch {0} has no label value'.format(branch_index)
+                        )
+                    string_fields = required_branch_fields.difference(
+                        {'use', 'label', 'branch_label'}
+                    )
+                    invalid_string_fields = sorted(
+                        field_name
+                        for field_name in string_fields
+                        if not isinstance(branch[field_name], str)
+                    )
+                    if invalid_string_fields:
+                        raise ValueError(
+                            'branch {0} fields must be text: {1}'.format(
+                                branch_index, ', '.join(invalid_string_fields)
+                            )
+                        )
+                for output_directory in (Path(csv_path), Path(area_volume_path)):
+                    if not output_directory.is_dir():
+                        raise NotADirectoryError(
+                            'table output directory does not exist: {0}'.format(
+                                output_directory
+                            )
+                        )
+                    file_descriptor, write_test_name = tempfile.mkstemp(
+                        prefix='.batch_table_write_test.',
+                        dir=str(output_directory),
+                    )
+                    os.close(file_descriptor)
+                    Path(write_test_name).unlink()
+                ready_case_paths.append(case_path)
+            except Exception as error:
+                self.UpdateMsgLog(
+                    'Skip table generation for case {0}: {1}'.format(
+                        Path(case_path).name, error
+                    )
+                )
+
+        self.DCMDirList = ready_case_paths
+        self.CTADirList = [
+            os.path.join(case_path, 'CTA', 'CTA.nii.gz')
+            for case_path in self.DCMDirList
+        ]
+        self.StoreListInformation()
 
     # create Filter Mask Object and batch process
     def GenerateTable(self):
+        """Build tables case by case so one bad case cannot stop later cases."""
+
+        case_paths = list(self.DCMDirList)
+        for attribute_name in GENERATED_TABLE_ATTRIBUTES:
+            setattr(self, attribute_name, [])
+
+        successful_case_paths = []
+        for case_path in case_paths:
+            table_lengths = {
+                attribute_name: len(getattr(self, attribute_name))
+                for attribute_name in GENERATED_TABLE_ATTRIBUTES
+            }
+            try:
+                self.DCMDirList = [case_path]
+                self.StoreListInformation()
+                self._GenerateTableCurrentCases(write_shared_tables=False)
+            except Exception as error:
+                for attribute_name, original_length in table_lengths.items():
+                    del getattr(self, attribute_name)[original_length:]
+                self.UpdateMsgLog(
+                    'Table generation failed; continuing: {0}: {1}'.format(
+                        Path(case_path).name,
+                        error,
+                    )
+                )
+            else:
+                successful_case_paths.append(case_path)
+
+        # Write the shared batch tables once, after every case has been attempted.
+        # An empty case list prevents the builder from appending duplicate rows.
+        self.DCMDirList = []
+        self.StoreListInformation()
+        try:
+            self._GenerateTableCurrentCases(write_shared_tables=True)
+        finally:
+            self.DCMDirList = successful_case_paths
+            self.CTADirList = [
+                os.path.join(case_path, 'CTA', 'CTA.nii.gz')
+                for case_path in successful_case_paths
+            ]
+            self.StoreListInformation()
+
+        return successful_case_paths
+
+    def _GenerateTableCurrentCases(self, write_shared_tables=True):
         # define table column titles
         FM_Head = ['MaskPath', 'MaskVal', 'NewMaskVal', 'OutputFolder', 'FileNameRef']
 
@@ -967,7 +2718,7 @@ class BatchCoronary:
             # case table csv file for each case
             caseFilePath = os.path.join(CSVPath, 'case.csv')
             case_df = pd.DataFrame(tempCaseTable, columns=Case_Head)
-            case_df.to_csv(caseFilePath, index=None)
+            _write_dataframe_atomic(case_df, caseFilePath)
 
             # add record to overall Xsection table
             self.XsectionTable.append([self.BranchPathList[loopIndex], CSVPath, self.XsectionPathList[loopIndex],
@@ -1330,86 +3081,306 @@ class BatchCoronary:
             # save branch table
             branchMFilePath = os.path.join(self.ArVolCalPathList[loopIndex], 'AVCBranM.csv')
             branchM_df = pd.DataFrame(AVCBranMTable, columns=AVCBranM_Head)
-            branchM_df.to_csv(branchMFilePath, index=None)
+            _write_dataframe_atomic(branchM_df, branchMFilePath)
 
             # save parameter table
             ParamFilePath = os.path.join(self.ArVolCalPathList[loopIndex], 'AVCParam.csv')
             Param_df = pd.DataFrame([[totInflow_AVC, diffThres_AVC, step_AVC, self.ArVolCalPathList[loopIndex],
                                       exo_AVC, mul_AVC]], columns=AVCParam_Head)
-            Param_df.to_csv(ParamFilePath, index=None)
+            _write_dataframe_atomic(Param_df, ParamFilePath)
 
             # batch files
             self.AVCTable.append([branchMFilePath, ParamFilePath])
 
+        if not write_shared_tables:
+            return
+
         # generate csv used for batch filter mask processing
         FM_df = pd.DataFrame(self.FilterMaskTable, columns=FM_Head)
-        FM_df.to_csv(self.FilterMaskTablePath, index=None)
+        _write_dataframe_atomic(FM_df, self.FilterMaskTablePath)
         # generate csv used for Batch Xsection
         Xsec_df = pd.DataFrame(self.XsectionTable, columns=Xsection_Head)
-        Xsec_df.to_csv(self.XsectionTablePath, index=None)
+        _write_dataframe_atomic(Xsec_df, self.XsectionTablePath)
         # generate csv used for Batch Lumen Correction
         XsecFix_df = pd.DataFrame(self.XsectionFixTable, columns=XsecFix_Head)
-        XsecFix_df.to_csv(self.XsectionFixTablePath, index=None)
+        _write_dataframe_atomic(XsecFix_df, self.XsectionFixTablePath)
         # generate csv used for batch extension
         XsecFixExt_df = pd.DataFrame(self.XsectionFixExtTable, columns=Extension_Head)
-        XsecFixExt_df.to_csv(self.XsectionFixExtTablePath, index=None)
+        _write_dataframe_atomic(XsecFixExt_df, self.XsectionFixExtTablePath)
         # generate csv used for batch xsection original volume
         OriVolume_df = pd.DataFrame(self.OriVolumeTable, columns=OriVolume_Head)
-        OriVolume_df.to_csv(self.OriVolumeTablePath, index=None)
+        _write_dataframe_atomic(OriVolume_df, self.OriVolumeTablePath)
         # stack segmentation
         SS_df = pd.DataFrame(self.SSTable, columns=SS_Head)
-        SS_df.to_csv(self.SSTablePath, index=None)
+        _write_dataframe_atomic(SS_df, self.SSTablePath)
         # stl generation
         SG_df = pd.DataFrame(self.SGTable, columns=SG_Head)
-        SG_df.to_csv(self.SGTablePath, index=None)
+        _write_dataframe_atomic(SG_df, self.SGTablePath)
         # murray's law
         AVC_df = pd.DataFrame(self.AVCTable, columns=AVCBatch_Head)
-        AVC_df.to_csv(self.AVCTablePath, index=None)
+        _write_dataframe_atomic(AVC_df, self.AVCTablePath)
         # generate csv used for Batch Lumen Correction
         XsecFix_df = pd.DataFrame(self.OriVolumeFixTable, columns=XsecFixOri_Head)
-        XsecFix_df.to_csv(self.OriVolumeFixTablePath, index=None)
+        _write_dataframe_atomic(XsecFix_df, self.OriVolumeFixTablePath)
 
         CFD_Mesh_df = pd.DataFrame(self.CFD_MeshTable, columns=CFD_Mesh_Head)
-        CFD_Mesh_df.to_csv(self.CFD_MeshTablePath, index=None)
+        _write_dataframe_atomic(CFD_Mesh_df, self.CFD_MeshTablePath)
 
         CFD_STLcut_df = pd.DataFrame(self.CFD_STLcutTable, columns=CFD_STLcut_Head)
-        CFD_STLcut_df.to_csv(self.CFD_STLcutTablePath, index=None)
+        _write_dataframe_atomic(CFD_STLcut_df, self.CFD_STLcutTablePath)
 
         CFD_STLmesh_df = pd.DataFrame(self.CFD_STLmeshTable, columns=CFD_STLmesh_Head)
-        CFD_STLmesh_df.to_csv(self.CFD_STLmeshTablePath, index=None)
+        _write_dataframe_atomic(CFD_STLmesh_df, self.CFD_STLmeshTablePath)
 
         CFD_FindFace_df = pd.DataFrame(self.CFD_FindFaceTable, columns=CFD_FindFace_Head)
-        CFD_FindFace_df.to_csv(self.CFD_FindFaceTablePath, index=None)
+        _write_dataframe_atomic(CFD_FindFace_df, self.CFD_FindFaceTablePath)
 
         CFD_GenerateIn_df = pd.DataFrame(self.CFD_GenerateInTable, columns=CFD_GenerateIn_Head)
-        CFD_GenerateIn_df.to_csv(self.CFD_GenerateInTablePath, index=None)
+        _write_dataframe_atomic(CFD_GenerateIn_df, self.CFD_GenerateInTablePath)
 
         CFD_PostProgress_df = pd.DataFrame(self.CFD_PostProgressTable, columns=CFD_Postprogress_Head)
-        CFD_PostProgress_df.to_csv(self.CFD_PostProgressTablePath, index=None)
+        _write_dataframe_atomic(CFD_PostProgress_df, self.CFD_PostProgressTablePath)
 
         CFD_DataOutput_df = pd.DataFrame(self.DataOutputTable, columns=CFD_DataOutput_Head)
-        CFD_DataOutput_df.to_csv(self.DataOutputTablePath, index=None)
+        _write_dataframe_atomic(CFD_DataOutput_df, self.DataOutputTablePath)
 
         CFD_PostNpy_df = pd.DataFrame(self.PostNpyTable, columns=CFD_PostNpy_Head)
-        CFD_PostNpy_df.to_csv(self.PostNpyTablePath, index=None)
+        _write_dataframe_atomic(CFD_PostNpy_df, self.PostNpyTablePath)
 
         CFD_Map_Result_df = pd.DataFrame(self.Map_ResultTable, columns=CFD_Map_Result_Head)
-        CFD_Map_Result_df.to_csv(self.Map_ResultTablePath, index=None)
+        _write_dataframe_atomic(CFD_Map_Result_df, self.Map_ResultTablePath)
 
         CFD_FFRCalculation_df = pd.DataFrame(self.FFRCalculationTable, columns=CFD_FFRCalculation_Head)
-        CFD_FFRCalculation_df.to_csv(self.FFRCalculationTablePath, index=None)
+        _write_dataframe_atomic(CFD_FFRCalculation_df, self.FFRCalculationTablePath)
 
         CFD_Paraview_df = pd.DataFrame(self.ParaviewTable, columns=CFD_Paraview_Head)
-        CFD_Paraview_df.to_csv(self.ParaviewTablePath, index=None)
+        _write_dataframe_atomic(CFD_Paraview_df, self.ParaviewTablePath)
 
         CFD_SaveVtu_df = pd.DataFrame(self.SaveVtuTable, columns=CFD_Savevtu_Head)
-        CFD_SaveVtu_df.to_csv(self.SaveVtuTablePath, index=None)
+        _write_dataframe_atomic(CFD_SaveVtu_df, self.SaveVtuTablePath)
 
     def BatchFilterMask(self):
-        # FilterMaskClass = self.model.filterMask(UI=self.model.FilterMaskui,Hedys=self.model)
-        # FilterMaskClass = FilterMaskMain.FilterMask()
-        # FilterMaskClass.BatchProcessing(self.FilterMaskTablePath)
-        self.model.filterMask.BatchProcessing(self.FilterMaskTablePath)
+        """Run Filter Mask independently per case with validation and resume."""
+
+        case_paths = list(self.DCMDirList)
+        plan_warnings = []
+        plans = _load_filter_mask_case_plans(
+            self.FilterMaskTablePath,
+            case_paths,
+            warning_messages=plan_warnings,
+        )
+        for warning in plan_warnings:
+            self.UpdateMsgLog(warning)
+        record_map = self._load_batch_segmentation_records()
+        ready_case_paths = []
+        failed_case_paths = []
+        outcomes = {}
+
+        for processed_count, case_path_text in enumerate(case_paths, 1):
+            case_path = Path(case_path_text)
+            case_key = _normalized_path_key(case_path)
+            rows = plans.get(case_key, [])
+            record = self._ensure_case_record(record_map, case_path)
+            fingerprint = ''
+            expected_paths = []
+            error_message = ''
+            skipped = False
+
+            try:
+                fingerprint, expected_paths = _filter_mask_case_fingerprint(
+                    case_path, rows
+                )
+                if (
+                        str(record.get('complete_filter_mask', '')) == '1'
+                        and str(record.get('filter_mask_failed', '')) == '0'
+                        and record.get('filter_mask_input_sha256', '') == fingerprint
+                        and _filter_mask_outputs_complete(expected_paths)):
+                    skipped = True
+            except Exception as error:
+                error_message = _clean_error_message(error)
+
+            if skipped:
+                record['run_filter_mask'] = 1
+                record['filter_mask_failed'] = 0
+                record['filter_mask_er_msg'] = ''
+                record['complete_filter_mask'] = 1
+                record['filter_mask_input_sha256'] = fingerprint
+                ready_case_paths.append(str(case_path))
+                outcomes[str(case_path)] = {
+                    'complete': True,
+                    'skipped': True,
+                    'error_message': '',
+                    'input_sha256': fingerprint,
+                }
+                self.UpdateMsgLog(
+                    'Skip completed Filter Mask case: {0}'.format(
+                        case_path.name
+                    )
+                )
+            elif error_message:
+                record['run_filter_mask'] = 1
+                record['filter_mask_failed'] = 1
+                record['filter_mask_er_msg'] = error_message
+                record['complete_filter_mask'] = 0
+                record['filter_mask_input_sha256'] = fingerprint
+                failed_case_paths.append(str(case_path))
+                outcomes[str(case_path)] = {
+                    'complete': False,
+                    'skipped': False,
+                    'error_message': error_message,
+                    'input_sha256': fingerprint,
+                }
+            else:
+                record['run_filter_mask'] = 1
+                record['filter_mask_failed'] = 1
+                record['filter_mask_er_msg'] = (
+                    'Filter Mask started but did not finish.'
+                )
+                record['complete_filter_mask'] = 0
+                record['filter_mask_input_sha256'] = fingerprint
+                self._save_batch_segmentation_record_map(record_map)
+
+                backup_paths = []
+                temporary_table_path = None
+                try:
+                    backup_suffix = '.pre_run_{0}_{1}'.format(
+                        os.getpid(),
+                        datetime.now().strftime('%Y%m%d%H%M%S%f'),
+                    )
+                    for output_index, expected_path in enumerate(expected_paths):
+                        expected_path = Path(expected_path)
+                        if not expected_path.exists():
+                            continue
+                        if not expected_path.is_file():
+                            raise ValueError(
+                                'Existing Filter Mask output is not a file: {0}'
+                                .format(expected_path)
+                            )
+                        backup_path = expected_path.with_name(
+                            expected_path.name
+                            + backup_suffix
+                            + '_{0}'.format(output_index)
+                        )
+                        counter = 1
+                        while backup_path.exists():
+                            backup_path = expected_path.with_name(
+                                expected_path.name
+                                + backup_suffix
+                                + '_{0}_{1}'.format(output_index, counter)
+                            )
+                            counter += 1
+                        os.replace(str(expected_path), str(backup_path))
+                        backup_paths.append(backup_path)
+
+                    file_descriptor, temporary_name = tempfile.mkstemp(
+                        prefix='.filter_mask_{0}.'.format(case_path.name),
+                        suffix='.csv',
+                        dir=str(self.TableDir),
+                        text=True,
+                    )
+                    os.close(file_descriptor)
+                    temporary_table_path = Path(temporary_name)
+                    case_rows = [
+                        {
+                            column: row[column]
+                            for column in FILTER_MASK_REQUIRED_COLUMNS
+                        }
+                        for row in rows
+                    ]
+                    _write_dataframe_atomic(
+                        pd.DataFrame(
+                            case_rows,
+                            columns=FILTER_MASK_REQUIRED_COLUMNS,
+                        ),
+                        temporary_table_path,
+                    )
+                    self.model.filterMask.BatchProcessing(
+                        str(temporary_table_path)
+                    )
+                    if not _filter_mask_outputs_complete(expected_paths):
+                        missing_outputs = [
+                            str(path) for path in expected_paths
+                            if not _is_nonempty_regular_file(path)
+                        ]
+                        raise ValueError(
+                            'Filter Mask outputs are missing or empty: {0}'.format(
+                                ', '.join(missing_outputs)
+                            )
+                        )
+                    for backup_path in backup_paths:
+                        backup_path.unlink()
+                    record['filter_mask_failed'] = 0
+                    record['filter_mask_er_msg'] = ''
+                    record['complete_filter_mask'] = 1
+                    ready_case_paths.append(str(case_path))
+                    outcomes[str(case_path)] = {
+                        'complete': True,
+                        'skipped': False,
+                        'error_message': '',
+                        'input_sha256': fingerprint,
+                    }
+                except Exception as error:
+                    error_message = _clean_error_message(error)
+                    record['filter_mask_failed'] = 1
+                    record['filter_mask_er_msg'] = error_message
+                    record['complete_filter_mask'] = 0
+                    failed_case_paths.append(str(case_path))
+                    outcomes[str(case_path)] = {
+                        'complete': False,
+                        'skipped': False,
+                        'error_message': error_message,
+                        'input_sha256': fingerprint,
+                    }
+                finally:
+                    if (temporary_table_path is not None
+                            and temporary_table_path.exists()):
+                        try:
+                            temporary_table_path.unlink()
+                        except OSError as cleanup_error:
+                            self.UpdateMsgLog(
+                                'Could not remove per-case Filter Mask table; '
+                                'continuing: {0}: {1}'.format(
+                                    temporary_table_path, cleanup_error
+                                )
+                            )
+
+            self._save_batch_segmentation_record_map(record_map)
+            self.UpdateMsgLog(
+                'Filter Mask progress: completed {0}, failed {1}, '
+                'processed {2}/{3}.'.format(
+                    len(ready_case_paths),
+                    len(failed_case_paths),
+                    processed_count,
+                    len(case_paths),
+                )
+            )
+
+        # Moving happens only after every case in the fixed snapshot was attempted.
+        self._move_failed_cases(
+            failed_case_paths,
+            record_map,
+            'filter_mask_er_msg',
+            'Filter Mask',
+        )
+        self.DCMDirList = ready_case_paths
+        self.CTADirList = [
+            os.path.join(case_path, 'CTA', 'CTA.nii.gz')
+            for case_path in ready_case_paths
+        ]
+        self.StoreListInformation()
+        try:
+            merge_batch_segmentation_records(
+                self.ManifestPath,
+                self.InitialSegmentationRoot,
+            )
+        except Exception as error:
+            self.UpdateMsgLog(
+                'Manifest merge warning after Filter Mask; batch record is '
+                'preserved at {0}: {1}'.format(
+                    self.BatchSegmentationRecordPath, error
+                )
+            )
+        return outcomes
 
     # create Xsection Object and batch process
     def BatchXsection(self):
@@ -1635,12 +3606,46 @@ class BatchCoronary:
     def mainFunction(self):
         self.initProcess()
         if self.ui:
-            self.WorkingDir = self.ui.LoadFolderPath_Txt_BPP.toPlainText()
-            self.CGEXEPath = self.ui.CGExePath_Txt_BPP.toPlainText()
-            self.CPREXEPath = self.ui.CPRExePath_Txt_BPP.toPlainText()
-            self.STLEXEPath = self.ui.STLGExePath_Txt_BPP.toPlainText()
+            self.WorkingDir = _widget_text(self.ui.LoadFolderPath_Txt_BPP)
+            self.CGEXEPath = _widget_text(self.ui.CGExePath_Txt_BPP)
+            self.CPREXEPath = _widget_text(self.ui.CPRExePath_Txt_BPP)
+            self.STLEXEPath = _widget_text(self.ui.STLGExePath_Txt_BPP)
         else:
             self.UpdateMsgLog('No UI')
+
+        if not self.WorkingDir:
+            raise ValueError('Working directory is required.')
+        working_path = Path(self.WorkingDir).expanduser().resolve()
+        if not working_path.is_dir():
+            raise NotADirectoryError(
+                'Working directory does not exist: {0}'.format(working_path)
+            )
+        self.WorkingDir = str(working_path)
+        self.BatchName = working_path.name
+        self.InitialSegmentationRoot = str(working_path.parent)
+
+        manifest_widget = getattr(self.ui, 'ManifestPath_Txt_BPP', None)
+        manifest_path = _widget_text(manifest_widget)
+        if not manifest_path:
+            manifest_path = str(working_path.parent / DEFAULT_MANIFEST_FILE_NAME)
+        self.ManifestPath = str(Path(manifest_path).expanduser())
+
+        failed_root_widget = getattr(self.ui, 'FailedRootPath_Txt_BPP', None)
+        failed_root_path = _widget_text(failed_root_widget)
+        if not failed_root_path:
+            if working_path.parent.name == '0_Initial_Segmentation':
+                failed_root_path = str(working_path.parent.parent)
+            else:
+                failed_root_path = str(working_path.parent)
+        self.FailedRootPath = str(Path(failed_root_path).expanduser())
+
+        timeout_minutes = _widget_integer(
+            getattr(self.ui, 'SegmentationTimeout_SB_BPP', None),
+            DEFAULT_SEGMENTATION_TIMEOUT_MINUTES,
+        )
+        if timeout_minutes <= 0:
+            raise ValueError('Segmentation timeout must be greater than zero.')
+        self.SegmentationTimeoutSeconds = timeout_minutes * 60
 
         # create overall table directory
         self.TableDir = os.path.join(self.WorkingDir, 'Table')
@@ -1689,6 +3694,12 @@ class BatchCoronary:
             self.BatchCenterlineGen()
             self.UpdateMsgLog('Centerline Generation done')
 
+        centerline_csv_lifecycle = bool(
+            self.CenterlineEFlag or self.UpdateJasonFlag
+        )
+        if centerline_csv_lifecycle:
+            self.BeginCenterlineCsvRun()
+
         # copy Jason for same lists
         if self.CopyJSONFlag:
             self.UpdateMsgLog('Copy JASON Start')
@@ -1715,6 +3726,11 @@ class BatchCoronary:
             self.BatchExtractCenterline()
             self.UpdateMsgLog('Centerline Extraction done')
 
+        if centerline_csv_lifecycle:
+            self.UpdateMsgLog('Centerline CSV safeguard start')
+            self.FinalizeCenterlineCsvRun()
+            self.UpdateMsgLog('Centerline CSV safeguard done')
+
         # create branch to be used json file
         if self.BranchDictFlag:
             self.UpdateMsgLog('Write Branch Dictionary start')
@@ -1724,13 +3740,16 @@ class BatchCoronary:
         # generate table
         if self.GenerateTFlag:
             self.UpdateMsgLog('Generate Table start')
+            self.RetainTableReadyCases()
             print(self.BranchPathList)
             self.GenerateTable()
             self.UpdateMsgLog('Generate Table done')
 
         # Filter mask
         if self.FMFlag:
+            self.UpdateMsgLog('Filter Mask start')
             self.BatchFilterMask()
+            self.UpdateMsgLog('Filter Mask done')
             # copy aorta
             # self.CopyAorta2OriVolumeFolder()
 

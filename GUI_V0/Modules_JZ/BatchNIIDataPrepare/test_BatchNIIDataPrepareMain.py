@@ -528,6 +528,160 @@ class BatchNIIDataPrepareTests(unittest.TestCase):
 
             self.assertTrue((batch_root / "Table").is_dir())
 
+    def test_processing_status_fields_default_and_survive_preparation_rerun(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            input_path = temporary_path / "input"
+            output_path = temporary_path / "output"
+            input_path.mkdir()
+            source_path = write_source(input_path, "CASE_001.nii.gz", b"source")
+
+            default_status = {
+                "run_segmentation": "0",
+                "seg_exe_failed": "0",
+                "seg_exe_er_msg": "",
+                "coronary_segment_failed": "0",
+                "complete_segmentation": "0",
+                "run_centerline_csv_check": "0",
+                "centerline_csv_failed": "0",
+                "centerline_csv_er_msg": "",
+                "complete_centerline_csv": "0",
+                "run_filter_mask": "0",
+                "filter_mask_failed": "0",
+                "filter_mask_er_msg": "",
+                "complete_filter_mask": "0",
+            }
+            recorded_status = {
+                "run_segmentation": "1",
+                "seg_exe_failed": "1",
+                "seg_exe_er_msg": "Part1 exited with code 9",
+                "coronary_segment_failed": "1",
+                "complete_segmentation": "0",
+                "run_centerline_csv_check": "1",
+                "centerline_csv_failed": "1",
+                "centerline_csv_er_msg": "Preproc/CSV is empty",
+                "complete_centerline_csv": "0",
+                "run_filter_mask": "1",
+                "filter_mask_failed": "0",
+                "filter_mask_er_msg": "",
+                "complete_filter_mask": "1",
+            }
+
+            result = prepare_batch_data(
+                input_path,
+                output_path,
+                create_pipeline_folders=False,
+            )
+            with result.manifest_path.open("r", encoding="utf-8", newline="") as csv_file:
+                reader = csv.DictReader(csv_file)
+                fieldnames = reader.fieldnames
+                rows = list(reader)
+
+            self.assertEqual(
+                {field: rows[0][field] for field in default_status},
+                default_status,
+            )
+
+            rows[0].update(recorded_status)
+            with result.manifest_path.open("w", encoding="utf-8", newline="") as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames, lineterminator="\n")
+                writer.writeheader()
+                writer.writerows(rows)
+
+            prepare_batch_data(
+                input_path,
+                output_path,
+                create_pipeline_folders=False,
+            )
+            with result.manifest_path.open("r", encoding="utf-8", newline="") as csv_file:
+                rerun_row = next(csv.DictReader(csv_file))
+
+            self.assertEqual(
+                {field: rerun_row[field] for field in recorded_status},
+                recorded_status,
+            )
+
+            source_path.write_bytes(b"changed source")
+            prepare_batch_data(
+                input_path,
+                output_path,
+                create_pipeline_folders=False,
+            )
+            with result.manifest_path.open("r", encoding="utf-8", newline="") as csv_file:
+                changed_source_row = next(csv.DictReader(csv_file))
+
+            self.assertEqual(
+                {field: changed_source_row[field] for field in default_status},
+                default_status,
+            )
+
+    def test_legacy_manifest_gets_defaults_for_new_downstream_status_fields(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            input_path = temporary_path / "input"
+            output_path = temporary_path / "output"
+            input_path.mkdir()
+            write_source(input_path, "CASE_001.nii.gz", b"source")
+
+            result = prepare_batch_data(
+                input_path,
+                output_path,
+                create_pipeline_folders=False,
+            )
+            with result.manifest_path.open("r", encoding="utf-8", newline="") as csv_file:
+                reader = csv.DictReader(csv_file)
+                fieldnames = reader.fieldnames
+                row = next(reader)
+
+            downstream_fields = (
+                "run_centerline_csv_check",
+                "centerline_csv_failed",
+                "centerline_csv_er_msg",
+                "complete_centerline_csv",
+                "run_filter_mask",
+                "filter_mask_failed",
+                "filter_mask_er_msg",
+                "complete_filter_mask",
+            )
+            legacy_fieldnames = [
+                field for field in fieldnames if field not in downstream_fields
+            ]
+            legacy_row = {field: row[field] for field in legacy_fieldnames}
+            legacy_row["run_segmentation"] = "1"
+            legacy_row["complete_segmentation"] = "1"
+            with result.manifest_path.open("w", encoding="utf-8", newline="") as csv_file:
+                writer = csv.DictWriter(
+                    csv_file,
+                    fieldnames=legacy_fieldnames,
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                writer.writerow(legacy_row)
+
+            prepare_batch_data(
+                input_path,
+                output_path,
+                create_pipeline_folders=False,
+            )
+            with result.manifest_path.open("r", encoding="utf-8", newline="") as csv_file:
+                upgraded_row = next(csv.DictReader(csv_file))
+
+            self.assertEqual(upgraded_row["run_segmentation"], "1")
+            self.assertEqual(upgraded_row["complete_segmentation"], "1")
+            self.assertEqual(
+                {field: upgraded_row[field] for field in downstream_fields},
+                {
+                    "run_centerline_csv_check": "0",
+                    "centerline_csv_failed": "0",
+                    "centerline_csv_er_msg": "",
+                    "complete_centerline_csv": "0",
+                    "run_filter_mask": "0",
+                    "filter_mask_failed": "0",
+                    "filter_mask_er_msg": "",
+                    "complete_filter_mask": "0",
+                },
+            )
+
     def test_nonempty_dicom_marker_is_never_truncated(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_path = Path(temporary_directory)

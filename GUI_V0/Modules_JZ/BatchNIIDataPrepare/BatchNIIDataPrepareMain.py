@@ -49,6 +49,43 @@ PIPELINE_CTA_RELATIVE_PATHS = (
     ("ori_volume", Path("Preproc") / "OriVolume" / "CTA.nii.gz"),
 )
 
+SEGMENTATION_FIELDS = (
+    "run_segmentation",
+    "seg_exe_failed",
+    "seg_exe_er_msg",
+    "coronary_segment_failed",
+    "complete_segmentation",
+)
+
+DOWNSTREAM_STATUS_FIELDS = (
+    "run_centerline_csv_check",
+    "centerline_csv_failed",
+    "centerline_csv_er_msg",
+    "complete_centerline_csv",
+    "run_filter_mask",
+    "filter_mask_failed",
+    "filter_mask_er_msg",
+    "complete_filter_mask",
+)
+
+PROCESSING_STATUS_FIELDS = SEGMENTATION_FIELDS + DOWNSTREAM_STATUS_FIELDS
+
+PROCESSING_STATUS_DEFAULTS = {
+    "run_segmentation": 0,
+    "seg_exe_failed": 0,
+    "seg_exe_er_msg": "",
+    "coronary_segment_failed": 0,
+    "complete_segmentation": 0,
+    "run_centerline_csv_check": 0,
+    "centerline_csv_failed": 0,
+    "centerline_csv_er_msg": "",
+    "complete_centerline_csv": 0,
+    "run_filter_mask": 0,
+    "filter_mask_failed": 0,
+    "filter_mask_er_msg": "",
+    "complete_filter_mask": 0,
+}
+
 MANIFEST_FIELDS = (
     "rank",
     "source_file",
@@ -76,7 +113,7 @@ MANIFEST_FIELDS = (
     "pipeline_copies_requested",
     "pipeline_copies_verified",
     "all_verified",
-)
+) + PROCESSING_STATUS_FIELDS
 
 
 @dataclass(frozen=True)
@@ -394,6 +431,36 @@ def _write_manifest_atomic(manifest_path, rows):
             temporary_path.unlink()
 
 
+def _read_segmentation_status(manifest_path):
+    """Return previously recorded processing fields keyed by batch and case."""
+
+    manifest_path = Path(manifest_path)
+    if not manifest_path.is_file():
+        return {}
+
+    statuses = {}
+    with manifest_path.open("r", encoding="utf-8", newline="") as csv_file:
+        reader = csv.DictReader(csv_file)
+        fieldnames = set(reader.fieldnames or ())
+        if not {"batch_name", "case_id"}.issubset(fieldnames):
+            return {}
+        for row in reader:
+            key = (
+                row.get("batch_name", "").strip().casefold(),
+                row.get("case_id", "").strip().casefold(),
+            )
+            if not all(key):
+                continue
+            status = {
+                field: row.get(field, "")
+                for field in PROCESSING_STATUS_FIELDS
+                if field in fieldnames
+            }
+            status["_source_sha256"] = row.get("source_sha256", "")
+            statuses[key] = status
+    return statuses
+
+
 def prepare_batch_data(
     input_folder,
     output_folder,
@@ -433,6 +500,8 @@ def prepare_batch_data(
     output_root = Path(output_folder).expanduser()
     data_root = output_root / OUTPUT_FOLDER_NAME
     data_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = data_root / MANIFEST_FILE_NAME
+    previous_processing_status = _read_segmentation_status(manifest_path)
 
     rows = []
     copied_file_count = 0
@@ -511,6 +580,20 @@ def prepare_batch_data(
             "pipeline_copies_verified": pipeline_verified,
             "all_verified": all_verified,
         }
+        processing_status = dict(PROCESSING_STATUS_DEFAULTS)
+        previous_status = previous_processing_status.get(
+            (plan.batch_name.casefold(), plan.case_id.casefold()),
+            {},
+        )
+        if previous_status.get("_source_sha256", "") == source_hash:
+            processing_status.update(
+                {
+                    field: previous_status[field]
+                    for field in PROCESSING_STATUS_FIELDS
+                    if field in previous_status
+                }
+            )
+        row.update(processing_status)
         for destination_key, _ in PIPELINE_CTA_RELATIVE_PATHS:
             if destination_key in destination_results:
                 destination_path, destination_hash = destination_results[destination_key]
@@ -518,7 +601,6 @@ def prepare_batch_data(
                 row["{0}_cta_sha256".format(destination_key)] = destination_hash
         rows.append(row)
 
-    manifest_path = data_root / MANIFEST_FILE_NAME
     _write_manifest_atomic(manifest_path, rows)
 
     return PreparationResult(
