@@ -78,6 +78,9 @@ SEGMENTATION_MASK_RELATIVE_PATH = Path('Preproc') / 'OriData' / 'sc_labelled_cor
 DEFAULT_SEGMENTATION_TIMEOUT_MINUTES = 20
 DEFAULT_MANIFEST_FILE_NAME = 'BatchNIIDataPrepare_manifest.csv'
 FAILED_SEGMENTATION_FOLDER_NAME = '0_Failed_Segmentation'
+SEGMENTATION_INTERRUPTED_MESSAGE = 'Segmentation started but did not finish.'
+CENTERLINE_CSV_INTERRUPTED_MESSAGE = 'Centerline CSV started but did not finish.'
+FILTER_MASK_INTERRUPTED_MESSAGE = 'Filter Mask started but did not finish.'
 LOCK_POLL_SECONDS = 0.1
 LOCK_TIMEOUT_SECONDS = 120
 MAX_SEGMENTATION_ERROR_LENGTH = 4000
@@ -147,6 +150,44 @@ def _widget_integer(widget, default):
         return int(value_method())
     except (TypeError, ValueError):
         return default
+
+
+def _classify_stage_record(
+        record,
+        failed_fields,
+        error_field,
+        interrupted_message,
+        fingerprint_field,
+        current_fingerprint,
+        complete_is_valid):
+    """Classify persisted work as complete, failed, or pending.
+
+    A terminal failure is reusable only for the same input fingerprint.  The
+    legacy start marker represents an interrupted run, even though older
+    ledgers wrote their failure bits as ``1`` before launching the work.
+    """
+
+    if complete_is_valid:
+        return 'complete'
+    if record is None:
+        return 'pending'
+
+    same_input = (
+        str(record.get(fingerprint_field, '') or '')
+        == str(current_fingerprint or '')
+    )
+    interrupted = (
+        _clean_error_message(record.get(error_field, ''))
+        == interrupted_message
+    )
+    terminal_failure = (
+        any(str(record.get(field_name, '')) == '1'
+            for field_name in failed_fields)
+        and not interrupted
+    )
+    if same_input and terminal_failure:
+        return 'failed'
+    return 'pending'
 
 
 def is_complete_segmentation(case_path):
@@ -957,6 +998,7 @@ class BatchCoronary:
         self.BranchDictionaryReadyCSVPaths = None
         self.CenterlineCsvOriginalCasePaths = []
         self.CenterlineCsvSkipPaths = set()
+        self.CenterlineCsvFailedPaths = set()
         self.CenterlineCsvSourceHashes = {}
         self.CenterlineJsonStageErrors = {}
         self.DCMDirList = []  # DCM list
@@ -1077,6 +1119,7 @@ class BatchCoronary:
         self.VisualizationPyVista = True
         self.VTUdataExtraction = True
         self.VisualizationParaview = True
+        self.RerunFailedCasesFlag = False
 
     def timmer(func):
         def warpper(self, *args, **kwargs):
@@ -1255,6 +1298,13 @@ class BatchCoronary:
         self.VisualizationPyVista = self.ui.VisualizationPyVista_CB_CPP.isChecked()
         self.VTUdataExtraction = self.ui.VTUdataExtraction_CB_CPP.isChecked()
         self.VisualizationParaview = self.ui.VisualizationParaview_CB_CPP.isChecked()
+        rerun_failed_widget = getattr(
+            self.ui, 'RerunFailedCases_CB_BPP', None
+        )
+        self.RerunFailedCasesFlag = bool(
+            rerun_failed_widget is not None
+            and rerun_failed_widget.isChecked()
+        )
 
     def ScanDCMDir(self):
         # get all folders that contain DCM
@@ -1539,6 +1589,15 @@ class BatchCoronary:
             record_map,
             error_field,
             stage_label):
+        if not self.FailedRootPath:
+            if failed_cases:
+                self.UpdateMsgLog(
+                    'Retained {0} failed {1} case(s) in the working batch '
+                    'for a future retry because no Failed Output Parent was '
+                    'selected.'.format(len(set(failed_cases)), stage_label)
+                )
+            return
+
         failed_batch_path = (
             Path(self.FailedRootPath)
             / FAILED_SEGMENTATION_FOLDER_NAME
@@ -1635,17 +1694,18 @@ class BatchCoronary:
                 )
             )
 
-        failed_batch_path = (
-            Path(self.FailedRootPath)
-            / FAILED_SEGMENTATION_FOLDER_NAME
-            / self.BatchName
-        )
-        if _path_is_within(failed_batch_path, self.WorkingDir):
-            raise ValueError(
-                'Failed segmentation output must be outside the working batch: {0}'.format(
-                    failed_batch_path
-                )
+        if self.FailedRootPath:
+            failed_batch_path = (
+                Path(self.FailedRootPath)
+                / FAILED_SEGMENTATION_FOLDER_NAME
+                / self.BatchName
             )
+            if _path_is_within(failed_batch_path, self.WorkingDir):
+                raise ValueError(
+                    'Failed segmentation output must be outside the working batch: {0}'.format(
+                        failed_batch_path
+                    )
+                )
         for case_path in self.DCMDirList:
             if (os.path.normcase(os.path.abspath(case_path))
                     == os.path.normcase(os.path.abspath(self.WorkingDir))):
@@ -1661,17 +1721,21 @@ class BatchCoronary:
             case_paths = list(self.DCMDirList)
             complete_case_paths = []
             failed_case_paths = []
+            known_failed_case_paths = []
             current_records = []
             skipped_count = 0
             executed_count = 0
 
             def segmentation_progress():
-                processed_count = len(complete_case_paths) + len(failed_case_paths)
+                failed_count = (
+                    len(failed_case_paths) + len(known_failed_case_paths)
+                )
+                processed_count = len(complete_case_paths) + failed_count
                 return (
                     'Batch progress: completed {0}, failed {1}, processed {2}/{3}.'
                     .format(
                         len(complete_case_paths),
-                        len(failed_case_paths),
+                        failed_count,
                         processed_count,
                         len(case_paths),
                     )
@@ -1697,17 +1761,42 @@ class BatchCoronary:
                         error
                     )
 
-                if (previous_record is not None
-                        and str(previous_record.get('complete_segmentation', '')) == '1'
-                        and str(previous_record.get('seg_exe_failed', '')) == '0'
-                        and source_sha256
-                        and previous_record.get('source_sha256', '') == source_sha256
-                        and is_complete_segmentation(case_path)):
+                complete_is_valid = (
+                    previous_record is not None
+                    and str(previous_record.get('complete_segmentation', '')) == '1'
+                    and str(previous_record.get('seg_exe_failed', '')) == '0'
+                    and str(previous_record.get('coronary_segment_failed', '')) == '0'
+                    and bool(source_sha256)
+                    and previous_record.get('source_sha256', '') == source_sha256
+                    and is_complete_segmentation(case_path)
+                )
+                stage_state = _classify_stage_record(
+                    previous_record,
+                    ('seg_exe_failed', 'coronary_segment_failed'),
+                    'seg_exe_er_msg',
+                    SEGMENTATION_INTERRUPTED_MESSAGE,
+                    'source_sha256',
+                    source_sha256,
+                    complete_is_valid,
+                )
+
+                if stage_state == 'complete':
                     skipped_count += 1
                     complete_case_paths.append(str(case_path))
                     current_records.append(previous_record)
                     self.UpdateMsgLog(
                         'Skip completed segmentation case: {0}\n{1}'.format(
+                            case_id, segmentation_progress()
+                        )
+                    )
+                    continue
+
+                if (stage_state == 'failed'
+                        and not self.RerunFailedCasesFlag):
+                    known_failed_case_paths.append(str(case_path))
+                    current_records.append(previous_record)
+                    self.UpdateMsgLog(
+                        'Skip recorded segmentation failure: {0}\n{1}'.format(
                             case_id, segmentation_progress()
                         )
                     )
@@ -1725,9 +1814,9 @@ class BatchCoronary:
                 record.update(SEGMENTATION_STATUS_DEFAULTS)
                 record.update({
                     'run_segmentation': 1,
-                    'seg_exe_failed': 1,
-                    'seg_exe_er_msg': 'Segmentation started but did not finish.',
-                    'coronary_segment_failed': 1,
+                    'seg_exe_failed': 0,
+                    'seg_exe_er_msg': SEGMENTATION_INTERRUPTED_MESSAGE,
+                    'coronary_segment_failed': 0,
                     'complete_segmentation': 0,
                 })
                 record_map[key] = record
@@ -1735,9 +1824,11 @@ class BatchCoronary:
                 self.UpdateMsgLog('Segmentation start: {0}'.format(case_id))
 
                 if source_hash_error:
+                    record['seg_exe_failed'] = 1
                     record['seg_exe_er_msg'] = _clean_error_message(
                         source_hash_error
                     )
+                    record['coronary_segment_failed'] = 1
                     self._save_batch_segmentation_record_map(record_map)
                     current_records.append(record)
                     failed_case_paths.append(str(case_path))
@@ -1750,10 +1841,12 @@ class BatchCoronary:
 
                 if (not self.CGEXEPath
                         or not Path(self.CGEXEPath).is_file()):
+                    record['seg_exe_failed'] = 1
                     record['seg_exe_er_msg'] = _clean_error_message(
                         'Centerline generation executable does not exist: {0}'
                         .format(self.CGEXEPath)
                     )
+                    record['coronary_segment_failed'] = 1
                     self._save_batch_segmentation_record_map(record_map)
                     current_records.append(record)
                     failed_case_paths.append(str(case_path))
@@ -1784,11 +1877,13 @@ class BatchCoronary:
                         )
                         os.replace(str(mask_path), str(stale_mask_path))
                 except Exception as error:
+                    record['seg_exe_failed'] = 1
                     record['seg_exe_er_msg'] = _clean_error_message(
                         'Could not preserve existing segmentation before rerun: {0}'.format(
                             error
                         )
                     )
+                    record['coronary_segment_failed'] = 1
                     self._save_batch_segmentation_record_map(record_map)
                     current_records.append(record)
                     failed_case_paths.append(str(case_path))
@@ -1861,17 +1956,22 @@ class BatchCoronary:
 
             self.UpdateMsgLog(
                 'Segmentation resume summary: skipped {0}, executed {1}, '
-                'completed {2}, failed {3}, total {4}.'.format(
+                'completed {2}, failed {3}, deferred failures {4}, total {5}.'
+                .format(
                     skipped_count,
                     executed_count,
                     len(complete_case_paths),
                     len(failed_case_paths),
+                    len(known_failed_case_paths),
                     len(case_paths),
                 )
             )
 
             # Moving happens only after every case in the fixed snapshot was attempted.
-            self._move_failed_segmentation_cases(failed_case_paths, record_map)
+            self._move_failed_segmentation_cases(
+                known_failed_case_paths + failed_case_paths,
+                record_map,
+            )
             # Also upgrades legacy ledgers when every case was resume-skipped.
             self._save_batch_segmentation_record_map(record_map)
             self.DCMDirList = complete_case_paths
@@ -1921,6 +2021,7 @@ class BatchCoronary:
 
         self.CenterlineCsvOriginalCasePaths = list(self.DCMDirList)
         self.CenterlineCsvSkipPaths = set()
+        self.CenterlineCsvFailedPaths = set()
         self.CenterlineCsvSourceHashes = {}
         self.CenterlineJsonStageErrors = {}
         record_map = self._load_batch_segmentation_records()
@@ -1941,22 +2042,51 @@ class BatchCoronary:
                     error
                 )
 
-            can_resume = (
+            complete_is_valid = (
                 str(record.get('complete_centerline_csv', '')) == '1'
                 and str(record.get('centerline_csv_failed', '')) == '0'
                 and bool(fingerprint)
                 and record.get('centerline_json_source_sha256', '') == fingerprint
                 and is_complete_centerline_csv(case_path)
             )
-            if can_resume:
+            stage_state = _classify_stage_record(
+                record,
+                ('centerline_csv_failed',),
+                'centerline_csv_er_msg',
+                CENTERLINE_CSV_INTERRUPTED_MESSAGE,
+                'centerline_json_source_sha256',
+                fingerprint,
+                complete_is_valid,
+            )
+            if stage_state == 'complete':
                 self.CenterlineCsvSkipPaths.add(case_key)
                 self.UpdateMsgLog(
                     'Skip completed centerline CSV case: {0}'.format(
                         case_path.name
                     )
                 )
+            elif (stage_state == 'failed'
+                    and not self.RerunFailedCasesFlag):
+                self.CenterlineCsvFailedPaths.add(case_key)
+                self.UpdateMsgLog(
+                    'Skip recorded centerline CSV failure: {0}'.format(
+                        case_path.name
+                    )
+                )
             else:
                 rerun_case_paths.append(str(case_path))
+                record['run_centerline_csv_check'] = 1
+                record['centerline_csv_failed'] = 0
+                record['centerline_csv_er_msg'] = (
+                    CENTERLINE_CSV_INTERRUPTED_MESSAGE
+                )
+                record['complete_centerline_csv'] = 0
+                record['centerline_json_source_sha256'] = fingerprint
+                record['run_filter_mask'] = 0
+                record['filter_mask_failed'] = 0
+                record['filter_mask_er_msg'] = ''
+                record['complete_filter_mask'] = 0
+                record['filter_mask_input_sha256'] = ''
 
         if self.CenterlineCsvOriginalCasePaths:
             self._save_batch_segmentation_record_map(record_map)
@@ -1967,16 +2097,19 @@ class BatchCoronary:
         ]
         self.StoreListInformation()
         self.UpdateMsgLog(
-            'Centerline CSV resume summary: skipped {0}, rerun {1}, total {2}.'
+            'Centerline CSV resume summary: skipped {0}, rerun {1}, '
+            'deferred failures {2}, total {3}.'
             .format(
                 len(self.CenterlineCsvSkipPaths),
                 len(rerun_case_paths),
+                len(self.CenterlineCsvFailedPaths),
                 len(self.CenterlineCsvOriginalCasePaths),
             )
         )
         return {
             'skipped': len(self.CenterlineCsvSkipPaths),
             'rerun': len(rerun_case_paths),
+            'failed': len(self.CenterlineCsvFailedPaths),
             'total': len(self.CenterlineCsvOriginalCasePaths),
         }
 
@@ -1989,12 +2122,37 @@ class BatchCoronary:
         record_map = self._load_batch_segmentation_records()
         ready_case_paths = []
         failed_case_paths = []
+        known_failed_case_paths = []
         outcomes = {}
 
         for checked_count, case_path_text in enumerate(original_case_paths, 1):
             case_path = Path(case_path_text)
             case_key = _normalized_path_key(case_path)
             record = self._ensure_case_record(record_map, case_path)
+            if case_key in self.CenterlineCsvFailedPaths:
+                error_message = _clean_error_message(
+                    record.get('centerline_csv_er_msg', '')
+                )
+                known_failed_case_paths.append(str(case_path))
+                outcomes[str(case_path)] = {
+                    'complete': False,
+                    'skipped_failed': True,
+                    'error_message': error_message,
+                    'source_sha256': record.get(
+                        'centerline_json_source_sha256', ''
+                    ),
+                }
+                self.UpdateMsgLog(
+                    'CSV safeguard: ready {0}, failed {1}, checked {2}/{3}.'
+                    .format(
+                        len(ready_case_paths),
+                        len(failed_case_paths) + len(known_failed_case_paths),
+                        checked_count,
+                        len(original_case_paths),
+                    )
+                )
+                continue
+
             errors = []
             fingerprint = self.CenterlineCsvSourceHashes.get(case_key, '')
             try:
@@ -2056,24 +2214,37 @@ class BatchCoronary:
         # If a multi-case batch has zero successful cases, hold every folder in
         # place.  A unanimous failure is much more likely to be a shared input,
         # configuration, or software problem than independent bad cases.
+        eligible_case_count = (
+            len(original_case_paths) - len(known_failed_case_paths)
+        )
         hold_entire_batch = (
-            len(original_case_paths) > 1
+            eligible_case_count > 1
             and not ready_case_paths
-            and len(failed_case_paths) == len(original_case_paths)
+            and len(failed_case_paths) == eligible_case_count
         )
         if hold_entire_batch:
-            self.UpdateMsgLog(
-                'SAFETY STOP: all {0} cases failed the centerline CSV '
-                'safeguard. No case folders were moved; review the recorded '
-                'errors before retrying.'.format(len(original_case_paths))
-            )
+            if known_failed_case_paths:
+                self.UpdateMsgLog(
+                    'SAFETY STOP: all {0} newly processed cases failed the '
+                    'centerline CSV safeguard. No newly processed case folders '
+                    'were moved; previously recorded failures remain queued '
+                    'for failed-output handling.'.format(eligible_case_count)
+                )
+            else:
+                self.UpdateMsgLog(
+                    'SAFETY STOP: all {0} cases failed the centerline CSV '
+                    'safeguard. No case folders were moved; review the recorded '
+                    'errors before retrying.'.format(eligible_case_count)
+                )
+            cases_to_move = known_failed_case_paths
         else:
-            self._move_failed_cases(
-                failed_case_paths,
-                record_map,
-                'centerline_csv_er_msg',
-                'centerline CSV',
-            )
+            cases_to_move = known_failed_case_paths + failed_case_paths
+        self._move_failed_cases(
+            cases_to_move,
+            record_map,
+            'centerline_csv_er_msg',
+            'centerline CSV',
+        )
         self.DCMDirList = ready_case_paths
         self.CTADirList = [
             os.path.join(case_path, 'CTA', 'CTA.nii.gz')
@@ -3185,6 +3356,7 @@ class BatchCoronary:
         record_map = self._load_batch_segmentation_records()
         ready_case_paths = []
         failed_case_paths = []
+        known_failed_case_paths = []
         outcomes = {}
 
         for processed_count, case_path_text in enumerate(case_paths, 1):
@@ -3195,22 +3367,32 @@ class BatchCoronary:
             fingerprint = ''
             expected_paths = []
             error_message = ''
-            skipped = False
 
             try:
                 fingerprint, expected_paths = _filter_mask_case_fingerprint(
                     case_path, rows
                 )
-                if (
-                        str(record.get('complete_filter_mask', '')) == '1'
-                        and str(record.get('filter_mask_failed', '')) == '0'
-                        and record.get('filter_mask_input_sha256', '') == fingerprint
-                        and _filter_mask_outputs_complete(expected_paths)):
-                    skipped = True
             except Exception as error:
                 error_message = _clean_error_message(error)
 
-            if skipped:
+            complete_is_valid = (
+                str(record.get('complete_filter_mask', '')) == '1'
+                and str(record.get('filter_mask_failed', '')) == '0'
+                and record.get('filter_mask_input_sha256', '') == fingerprint
+                and bool(expected_paths)
+                and _filter_mask_outputs_complete(expected_paths)
+            )
+            stage_state = _classify_stage_record(
+                record,
+                ('filter_mask_failed',),
+                'filter_mask_er_msg',
+                FILTER_MASK_INTERRUPTED_MESSAGE,
+                'filter_mask_input_sha256',
+                fingerprint,
+                complete_is_valid,
+            )
+
+            if stage_state == 'complete':
                 record['run_filter_mask'] = 1
                 record['filter_mask_failed'] = 0
                 record['filter_mask_er_msg'] = ''
@@ -3225,6 +3407,23 @@ class BatchCoronary:
                 }
                 self.UpdateMsgLog(
                     'Skip completed Filter Mask case: {0}'.format(
+                        case_path.name
+                    )
+                )
+            elif (stage_state == 'failed'
+                    and not self.RerunFailedCasesFlag):
+                known_failed_case_paths.append(str(case_path))
+                outcomes[str(case_path)] = {
+                    'complete': False,
+                    'skipped': True,
+                    'skipped_failed': True,
+                    'error_message': record.get('filter_mask_er_msg', ''),
+                    'input_sha256': record.get(
+                        'filter_mask_input_sha256', ''
+                    ),
+                }
+                self.UpdateMsgLog(
+                    'Skip recorded Filter Mask failure: {0}'.format(
                         case_path.name
                     )
                 )
@@ -3243,10 +3442,8 @@ class BatchCoronary:
                 }
             else:
                 record['run_filter_mask'] = 1
-                record['filter_mask_failed'] = 1
-                record['filter_mask_er_msg'] = (
-                    'Filter Mask started but did not finish.'
-                )
+                record['filter_mask_failed'] = 0
+                record['filter_mask_er_msg'] = FILTER_MASK_INTERRUPTED_MESSAGE
                 record['complete_filter_mask'] = 0
                 record['filter_mask_input_sha256'] = fingerprint
                 self._save_batch_segmentation_record_map(record_map)
@@ -3360,7 +3557,7 @@ class BatchCoronary:
                 'Filter Mask progress: completed {0}, failed {1}, '
                 'processed {2}/{3}.'.format(
                     len(ready_case_paths),
-                    len(failed_case_paths),
+                    len(failed_case_paths) + len(known_failed_case_paths),
                     processed_count,
                     len(case_paths),
                 )
@@ -3368,7 +3565,7 @@ class BatchCoronary:
 
         # Moving happens only after every case in the fixed snapshot was attempted.
         self._move_failed_cases(
-            failed_case_paths,
+            known_failed_case_paths + failed_case_paths,
             record_map,
             'filter_mask_er_msg',
             'Filter Mask',
@@ -3643,12 +3840,10 @@ class BatchCoronary:
 
         failed_root_widget = getattr(self.ui, 'FailedRootPath_Txt_BPP', None)
         failed_root_path = _widget_text(failed_root_widget)
-        if not failed_root_path:
-            if working_path.parent.name == '0_Initial_Segmentation':
-                failed_root_path = str(working_path.parent.parent)
-            else:
-                failed_root_path = str(working_path.parent)
-        self.FailedRootPath = str(Path(failed_root_path).expanduser())
+        self.FailedRootPath = (
+            str(Path(failed_root_path).expanduser())
+            if failed_root_path else None
+        )
 
         timeout_minutes = _widget_integer(
             getattr(self.ui, 'SegmentationTimeout_SB_BPP', None),

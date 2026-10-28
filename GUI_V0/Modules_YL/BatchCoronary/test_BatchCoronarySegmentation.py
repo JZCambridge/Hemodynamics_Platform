@@ -7,6 +7,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+import xml.etree.ElementTree as ET
 
 
 MODULE_DIRECTORY = Path(__file__).resolve().parent
@@ -533,6 +534,193 @@ class SegmentationRecordTests(unittest.TestCase):
                 ],
             )
 
+    def test_blank_failed_root_skips_failure_until_retry_is_checked(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths = make_batch_controller(
+                temporary_directory,
+                ("CASE_RETRY", "CASE_COMPLETE"),
+            )
+            controller.FailedRootPath = None
+            messages = []
+            controller.UpdateMsgLog = messages.append
+
+            first_runner = FakeSafeRunner(("CASE_COMPLETE",))
+            controller._run_tracked_segmentation(first_runner)
+
+            self.assertEqual(
+                first_runner.case_ids, ["CASE_RETRY", "CASE_COMPLETE"]
+            )
+            self.assertTrue(case_paths[0].is_dir())
+            self.assertTrue(case_paths[1].is_dir())
+            self.assertFalse(
+                (
+                    Path(temporary_directory)
+                    / "0_Failed_Segmentation"
+                    / "batch_0"
+                    / "CASE_RETRY"
+                ).exists()
+            )
+            self.assertTrue(
+                any("future retry" in message for message in messages),
+                messages,
+            )
+
+            # mainFunction rescans the batch on every invocation. Recreate that
+            # fixed case snapshot to verify both persisted outcomes are skipped.
+            controller.DCMDirList = [str(path) for path in case_paths]
+            controller.StoreListInformation()
+            second_runner = FakeSafeRunner(("CASE_RETRY", "CASE_COMPLETE"))
+
+            second_records = controller._run_tracked_segmentation(second_runner)
+
+            self.assertEqual(second_runner.case_ids, [])
+            records_by_id = {
+                record["case_id"]: record for record in second_records
+            }
+            self.assertEqual(
+                str(records_by_id["CASE_RETRY"]["complete_segmentation"]), "0"
+            )
+            self.assertEqual(
+                str(records_by_id["CASE_COMPLETE"]["complete_segmentation"]),
+                "1",
+            )
+            self.assertEqual(
+                controller.DCMDirList,
+                [str(case_paths[1])],
+            )
+
+            controller.DCMDirList = [str(path) for path in case_paths]
+            controller.StoreListInformation()
+            controller.RerunFailedCasesFlag = True
+            retry_runner = FakeSafeRunner(("CASE_RETRY", "CASE_COMPLETE"))
+
+            retry_records = controller._run_tracked_segmentation(retry_runner)
+
+            self.assertEqual(retry_runner.case_ids, ["CASE_RETRY"])
+            retry_records_by_id = {
+                record["case_id"]: record for record in retry_records
+            }
+            self.assertEqual(
+                retry_records_by_id["CASE_RETRY"]["complete_segmentation"], 1
+            )
+            self.assertEqual(
+                controller.DCMDirList,
+                [str(case_paths[0]), str(case_paths[1])],
+            )
+
+    def test_known_failure_is_not_executed_and_moves_after_pending_work(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths = make_batch_controller(
+                temporary_directory,
+                ("CASE_KNOWN_FAIL", "CASE_PENDING", "CASE_DONE"),
+            )
+            controller.FailedRootPath = None
+            controller.DCMDirList = [str(case_paths[0]), str(case_paths[2])]
+            controller.StoreListInformation()
+            controller._run_tracked_segmentation(
+                FakeSafeRunner(("CASE_DONE",))
+            )
+
+            controller.FailedRootPath = str(Path(temporary_directory))
+            controller.DCMDirList = [str(path) for path in case_paths]
+            controller.StoreListInformation()
+            pending_runner = FakeSafeRunner(("CASE_PENDING",))
+
+            def runner(destination, exe_path, timeout_seconds, output_limit):
+                self.assertTrue(case_paths[0].is_dir())
+                return pending_runner(
+                    destination, exe_path, timeout_seconds, output_limit
+                )
+
+            controller._run_tracked_segmentation(runner)
+
+            self.assertEqual(pending_runner.case_ids, ["CASE_PENDING"])
+            self.assertFalse(case_paths[0].exists())
+            self.assertTrue(case_paths[1].is_dir())
+            self.assertTrue(case_paths[2].is_dir())
+            self.assertTrue(
+                (
+                    Path(temporary_directory)
+                    / "0_Failed_Segmentation"
+                    / "batch_0"
+                    / "CASE_KNOWN_FAIL"
+                ).is_dir()
+            )
+            self.assertEqual(
+                controller.DCMDirList,
+                [str(case_paths[1]), str(case_paths[2])],
+            )
+
+    def test_legacy_interrupted_segmentation_resumes_with_clean_running_bits(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths = make_batch_controller(
+                temporary_directory, ("CASE_INTERRUPTED",)
+            )
+            case_path = case_paths[0]
+            record_map = controller._load_batch_segmentation_records()
+            record = controller._ensure_case_record(record_map, case_path)
+            record.update({
+                "source_sha256": BatchCoronaryMain._sha256_file(
+                    case_path / "Preproc" / "OriData" / "CTA.nii.gz"
+                ),
+                "run_segmentation": 1,
+                "seg_exe_failed": 1,
+                "seg_exe_er_msg": (
+                    BatchCoronaryMain.SEGMENTATION_INTERRUPTED_MESSAGE
+                ),
+                "coronary_segment_failed": 1,
+                "complete_segmentation": 0,
+            })
+            controller._save_batch_segmentation_record_map(record_map)
+
+            calls = []
+
+            def runner(destination, exe_path, timeout_seconds, output_limit):
+                del exe_path, timeout_seconds, output_limit
+                calls.append(Path(destination).parents[1].name)
+                running_record = read_csv(
+                    controller.BatchSegmentationRecordPath
+                )[0]
+                self.assertEqual(running_record["seg_exe_failed"], "0")
+                self.assertEqual(
+                    running_record["coronary_segment_failed"], "0"
+                )
+                self.assertEqual(
+                    running_record["seg_exe_er_msg"],
+                    BatchCoronaryMain.SEGMENTATION_INTERRUPTED_MESSAGE,
+                )
+                (
+                    Path(destination)
+                    / "sc_labelled_coronary_segment.nii.gz"
+                ).write_bytes(b"resumed-mask")
+                return {"exe_failed": False, "error_message": ""}
+
+            controller._run_tracked_segmentation(runner)
+
+            self.assertEqual(calls, ["CASE_INTERRUPTED"])
+            self.assertEqual(controller.DCMDirList, [str(case_path)])
+
+    def test_changed_cta_retries_a_recorded_failure_while_unchecked(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths = make_batch_controller(
+                temporary_directory, ("CASE_CHANGED_FAILURE",)
+            )
+            controller.FailedRootPath = None
+            controller._run_tracked_segmentation(FakeSafeRunner(()))
+
+            source_path = (
+                case_paths[0] / "Preproc" / "OriData" / "CTA.nii.gz"
+            )
+            source_path.write_bytes(b"changed-after-failure")
+            controller.DCMDirList = [str(case_paths[0])]
+            controller.StoreListInformation()
+            changed_runner = FakeSafeRunner(("CASE_CHANGED_FAILURE",))
+
+            controller._run_tracked_segmentation(changed_runner)
+
+            self.assertEqual(changed_runner.case_ids, ["CASE_CHANGED_FAILURE"])
+            self.assertEqual(controller.DCMDirList, [str(case_paths[0])])
+
     def test_failed_destination_collision_is_preserved_and_does_not_abort(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             controller, case_paths = make_batch_controller(
@@ -1055,7 +1243,10 @@ class CenterlineCsvOrchestrationTests(unittest.TestCase):
             make_complete_centerline_csv(case_paths[1])
             outcomes = controller.FinalizeCenterlineCsvRun()
 
-            self.assertEqual(resume, {"skipped": 0, "rerun": 3, "total": 3})
+            self.assertEqual(
+                resume,
+                {"skipped": 0, "rerun": 3, "failed": 0, "total": 3},
+            )
             self.assertTrue(all(result["complete"] for result in staged.values()))
             self.assertFalse(outcomes[str(case_paths[0])]["complete"])
             self.assertTrue(outcomes[str(case_paths[1])]["complete"])
@@ -1101,6 +1292,91 @@ class CenterlineCsvOrchestrationTests(unittest.TestCase):
                 manifest_rows["CASE_OK_MIDDLE"]["complete_centerline_csv"], "1"
             )
 
+    def test_known_centerline_failure_skips_execution_then_moves(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths = make_batch_controller(
+                temporary_directory,
+                ("CASE_CSV_FAILED", "CASE_CSV_PENDING"),
+            )
+            for case_path in case_paths:
+                make_centerline_sources(case_path)
+
+            controller.FailedRootPath = None
+            controller.DCMDirList = [str(case_paths[0])]
+            controller.StoreListInformation()
+            controller.BeginCenterlineCsvRun()
+            controller.CopyCenterlineJson()
+            controller.FinalizeCenterlineCsvRun()
+            self.assertTrue(case_paths[0].is_dir())
+
+            controller.FailedRootPath = str(Path(temporary_directory))
+            controller.DCMDirList = [str(path) for path in case_paths]
+            controller.StoreListInformation()
+            resume = controller.BeginCenterlineCsvRun()
+
+            self.assertEqual(
+                resume,
+                {"skipped": 0, "rerun": 1, "failed": 1, "total": 2},
+            )
+            self.assertEqual(controller.DCMDirList, [str(case_paths[1])])
+            self.assertTrue(case_paths[0].is_dir())
+            staged = controller.CopyCenterlineJson()
+            self.assertEqual(list(staged), [str(case_paths[1])])
+            make_complete_centerline_csv(case_paths[1])
+
+            outcomes = controller.FinalizeCenterlineCsvRun()
+
+            self.assertTrue(outcomes[str(case_paths[0])]["skipped_failed"])
+            self.assertTrue(outcomes[str(case_paths[1])]["complete"])
+            self.assertFalse(case_paths[0].exists())
+            self.assertTrue(
+                (
+                    Path(temporary_directory)
+                    / "0_Failed_Segmentation"
+                    / "batch_0"
+                    / "CASE_CSV_FAILED"
+                ).is_dir()
+            )
+            self.assertEqual(controller.DCMDirList, [str(case_paths[1])])
+
+    def test_checked_centerline_failure_is_retried(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths = make_batch_controller(
+                temporary_directory, ("CASE_CSV_RETRY",)
+            )
+            case_path = case_paths[0]
+            make_centerline_sources(case_path)
+            controller.FailedRootPath = None
+            controller.BeginCenterlineCsvRun()
+            controller.CopyCenterlineJson()
+            controller.FinalizeCenterlineCsvRun()
+
+            controller.FailedRootPath = str(Path(temporary_directory))
+            controller.RerunFailedCasesFlag = True
+            controller.DCMDirList = [str(case_path)]
+            controller.StoreListInformation()
+            resume = controller.BeginCenterlineCsvRun()
+
+            self.assertEqual(
+                resume,
+                {"skipped": 0, "rerun": 1, "failed": 0, "total": 1},
+            )
+            running_record = read_csv(
+                controller.BatchSegmentationRecordPath
+            )[0]
+            self.assertEqual(running_record["centerline_csv_failed"], "0")
+            self.assertEqual(
+                running_record["centerline_csv_er_msg"],
+                BatchCoronaryMain.CENTERLINE_CSV_INTERRUPTED_MESSAGE,
+            )
+            controller.CopyCenterlineJson()
+            make_complete_centerline_csv(case_path)
+            outcomes = controller.FinalizeCenterlineCsvRun()
+
+            self.assertTrue(outcomes[str(case_path)]["complete"])
+            self.assertTrue(case_path.is_dir())
+            self.assertEqual(controller.DCMDirList, [str(case_path)])
+
     def test_resume_requires_matching_source_hash_and_valid_outputs(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             controller, case_paths = make_batch_controller(
@@ -1117,7 +1393,10 @@ class CenterlineCsvOrchestrationTests(unittest.TestCase):
             controller.DCMDirList = [str(case_path)]
             controller.StoreListInformation()
             unchanged = controller.BeginCenterlineCsvRun()
-            self.assertEqual(unchanged, {"skipped": 1, "rerun": 0, "total": 1})
+            self.assertEqual(
+                unchanged,
+                {"skipped": 1, "rerun": 0, "failed": 0, "total": 1},
+            )
             self.assertEqual(controller.DCMDirList, [])
 
             controller.DCMDirList = [str(case_path)]
@@ -1127,7 +1406,8 @@ class CenterlineCsvOrchestrationTests(unittest.TestCase):
             )
             changed_source = controller.BeginCenterlineCsvRun()
             self.assertEqual(
-                changed_source, {"skipped": 0, "rerun": 1, "total": 1}
+                changed_source,
+                {"skipped": 0, "rerun": 1, "failed": 0, "total": 1},
             )
 
             # Restore and record the changed source/output state as complete.
@@ -1147,7 +1427,8 @@ class CenterlineCsvOrchestrationTests(unittest.TestCase):
             controller.StoreListInformation()
             truncated_output = controller.BeginCenterlineCsvRun()
             self.assertEqual(
-                truncated_output, {"skipped": 0, "rerun": 1, "total": 1}
+                truncated_output,
+                {"skipped": 0, "rerun": 1, "failed": 0, "total": 1},
             )
 
     def test_downstream_check_creates_a_ledger_without_segmentation_run(self):
@@ -1169,6 +1450,12 @@ class CenterlineCsvOrchestrationTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["case_id"], "CASE_NO_SEG_RUN")
             self.assertEqual(rows[0]["run_segmentation"], "0")
+            self.assertEqual(rows[0]["run_centerline_csv_check"], "1")
+            self.assertEqual(rows[0]["centerline_csv_failed"], "0")
+            self.assertEqual(
+                rows[0]["centerline_csv_er_msg"],
+                BatchCoronaryMain.CENTERLINE_CSV_INTERRUPTED_MESSAGE,
+            )
             self.assertEqual(rows[0]["complete_centerline_csv"], "0")
 
 
@@ -1256,6 +1543,127 @@ class FilterMaskResumeTests(unittest.TestCase):
                     "Filter Mask progress: completed 1, failed 1, processed 2/2.",
                 ],
             )
+
+    def test_known_filter_failure_skips_execution_then_moves(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths = make_batch_controller(
+                temporary_directory, ("CASE_FILTER_RECORDED_FAIL",)
+            )
+            controller.FailedRootPath = None
+            controller.FilterMaskTablePath = str(
+                Path(controller.TableDir) / "FilterMask.csv"
+            )
+            write_filter_mask_table(controller.FilterMaskTablePath, case_paths)
+            first_filter = FakeFilterMask(("CASE_FILTER_RECORDED_FAIL",))
+            controller.model = SimpleNamespace(filterMask=first_filter)
+            controller.BatchFilterMask()
+            self.assertTrue(case_paths[0].is_dir())
+
+            controller.FailedRootPath = str(Path(temporary_directory))
+            controller.DCMDirList = [str(case_paths[0])]
+            controller.StoreListInformation()
+            skipped_filter = FakeFilterMask()
+            controller.model = SimpleNamespace(filterMask=skipped_filter)
+
+            outcomes = controller.BatchFilterMask()
+
+            self.assertEqual(skipped_filter.case_ids, [])
+            self.assertTrue(
+                outcomes[str(case_paths[0])]["skipped_failed"]
+            )
+            self.assertFalse(case_paths[0].exists())
+            self.assertTrue(
+                (
+                    Path(temporary_directory)
+                    / "0_Failed_Segmentation"
+                    / "batch_0"
+                    / "CASE_FILTER_RECORDED_FAIL"
+                ).is_dir()
+            )
+            self.assertEqual(controller.DCMDirList, [])
+
+    def test_checked_filter_failure_is_retried(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths = make_batch_controller(
+                temporary_directory, ("CASE_FILTER_RETRY",)
+            )
+            controller.FailedRootPath = None
+            controller.FilterMaskTablePath = str(
+                Path(controller.TableDir) / "FilterMask.csv"
+            )
+            write_filter_mask_table(controller.FilterMaskTablePath, case_paths)
+            controller.model = SimpleNamespace(
+                filterMask=FakeFilterMask(("CASE_FILTER_RETRY",))
+            )
+            controller.BatchFilterMask()
+
+            controller.RerunFailedCasesFlag = True
+            controller.DCMDirList = [str(case_paths[0])]
+            controller.StoreListInformation()
+            retry_filter = FakeFilterMask()
+            controller.model = SimpleNamespace(filterMask=retry_filter)
+
+            outcomes = controller.BatchFilterMask()
+
+            self.assertEqual(retry_filter.case_ids, ["CASE_FILTER_RETRY"])
+            self.assertTrue(outcomes[str(case_paths[0])]["complete"])
+            self.assertEqual(controller.DCMDirList, [str(case_paths[0])])
+
+    def test_legacy_interrupted_filter_resumes_with_clean_running_bit(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths = make_batch_controller(
+                temporary_directory, ("CASE_FILTER_INTERRUPTED",)
+            )
+            controller.FilterMaskTablePath = str(
+                Path(controller.TableDir) / "FilterMask.csv"
+            )
+            write_filter_mask_table(controller.FilterMaskTablePath, case_paths)
+            plans = BatchCoronaryMain._load_filter_mask_case_plans(
+                controller.FilterMaskTablePath, [str(case_paths[0])]
+            )
+            case_key = BatchCoronaryMain._normalized_path_key(case_paths[0])
+            fingerprint, _expected_paths = (
+                BatchCoronaryMain._filter_mask_case_fingerprint(
+                    case_paths[0], plans[case_key]
+                )
+            )
+            record_map = controller._load_batch_segmentation_records()
+            record = controller._ensure_case_record(record_map, case_paths[0])
+            record.update({
+                "run_filter_mask": 1,
+                "filter_mask_failed": 1,
+                "filter_mask_er_msg": (
+                    BatchCoronaryMain.FILTER_MASK_INTERRUPTED_MESSAGE
+                ),
+                "complete_filter_mask": 0,
+                "filter_mask_input_sha256": fingerprint,
+            })
+            controller._save_batch_segmentation_record_map(record_map)
+            test_case = self
+
+            class InspectingFilterMask(FakeFilterMask):
+                def BatchProcessing(self, table_path):
+                    running_record = read_csv(
+                        controller.BatchSegmentationRecordPath
+                    )[0]
+                    test_case.assertEqual(
+                        running_record["filter_mask_failed"], "0"
+                    )
+                    test_case.assertEqual(
+                        running_record["filter_mask_er_msg"],
+                        BatchCoronaryMain.FILTER_MASK_INTERRUPTED_MESSAGE,
+                    )
+                    super().BatchProcessing(table_path)
+
+            inspecting_filter = InspectingFilterMask()
+            controller.model = SimpleNamespace(filterMask=inspecting_filter)
+
+            outcomes = controller.BatchFilterMask()
+
+            self.assertEqual(
+                inspecting_filter.case_ids, ["CASE_FILTER_INTERRUPTED"]
+            )
+            self.assertTrue(outcomes[str(case_paths[0])]["complete"])
 
     def test_resume_skips_valid_outputs_but_changed_input_forces_rerun(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1379,6 +1787,28 @@ class FilterMaskResumeTests(unittest.TestCase):
                     / "CASE_FILTER_NO_ROWS"
                 ).is_dir()
             )
+
+
+class ResumeUiTests(unittest.TestCase):
+    def test_rerun_failed_checkbox_exists_and_defaults_unchecked(self):
+        ui_path = GUI_ROOT / "ui" / "BatchPreProcessing.ui"
+        root = ET.parse(str(ui_path)).getroot()
+        checkbox = root.find(
+            ".//widget[@name='RerunFailedCases_CB_BPP']"
+        )
+
+        self.assertIsNotNone(checkbox)
+        properties = {
+            property_node.get("name"): property_node
+            for property_node in checkbox.findall("property")
+        }
+        self.assertEqual(
+            properties["checked"].findtext("bool"), "false"
+        )
+        self.assertEqual(
+            properties["text"].findtext("string"),
+            "Also rerun failed cases",
+        )
 
 
 if __name__ == "__main__":

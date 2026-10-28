@@ -47,6 +47,12 @@ DEFAULT_MANIFEST_FILE_NAME = 'BatchNIIDataPrepare_manifest.csv'
 FAILED_XSECTION_FOLDER_NAME = '0_Failed_Xsection'
 DEFAULT_XSECTION_TIMEOUT_MINUTES = 20
 MAX_XSECTION_ERROR_LENGTH = 4000
+FILTER_MASK_INTERRUPTED_MESSAGE = 'Filter Mask started but did not finish.'
+XSECTION_INTERRUPTED_MESSAGE = 'Xsection process started but did not finish.'
+LUMEN_INTERRUPTED_MESSAGE = 'Lumen Correction started but did not finish.'
+FILTER_MASK_REGENERATION_MESSAGE = 'Filter Mask requires downstream regeneration'
+CTA_REGENERATION_MESSAGE = 'CTA xsection requires Lumen Correction regeneration'
+SEG_REGENERATION_MESSAGE = 'seg xsection requires Lumen Correction regeneration'
 LOCK_TIMEOUT_SECONDS = 120
 LOCK_POLL_SECONDS = 0.1
 ATOMIC_REPLACE_ATTEMPTS = 10
@@ -734,6 +740,7 @@ class BatchSliceRadiomics:
         self.LCFlag = True
         self.MaskXsectionFlag = True
         self.MaskXsectionOnlyFlag = False
+        self.RerunFailedFlag = False
         self.SelectedArteries = list(XSECTION_ARTERY_NAMES)
         self.XsectionTimeoutSeconds = DEFAULT_XSECTION_TIMEOUT_MINUTES * 60
 
@@ -763,6 +770,9 @@ class BatchSliceRadiomics:
         )
         self.MaskXsectionOnlyFlag = _widget_checked(
             getattr(self.ui, 'maskXsectionOnly_CB_BSRJZ', None), False
+        )
+        self.RerunFailedFlag = _widget_checked(
+            getattr(self.ui, 'RerunFailedCases_CB_BSRJZ', None), False
         )
         artery_widgets = (
             ('LCx', 'pmdCx_CB_BSRJZ'),
@@ -1092,6 +1102,8 @@ class BatchSliceRadiomics:
             CPRAngle='0',
             maskXsection=None,
             maskXsectionOnly=None):
+        if not self.SelectedArteries:
+            raise ValueError('Select at least one artery before generating tables')
         if maskXsection is None:
             maskXsection = self.MaskXsectionFlag
         if maskXsectionOnly is None:
@@ -1223,6 +1235,9 @@ class BatchSliceRadiomics:
         return successful_cases
 
     def BatchFilterMask(self):
+        if not self.SelectedArteries:
+            raise ValueError('Select at least one artery before running Filter Mask')
+
         table_path = Path(self.FilterMaskTablePath)
         if not table_path.is_file():
             legacy_path = Path(self.TableDir) / 'FilterMask.csv'
@@ -1236,41 +1251,31 @@ class BatchSliceRadiomics:
 
         record_map = self._load_xsection_record_map()
         outcomes = {}
+        skipped_arteries = 0
+        skipped_failed_arteries = 0
+        completed_arteries = 0
+        incomplete_arteries = 0
+        table_error_cases = 0
         for case_path_text, branch_path_text in zip(
                 self.DCMDirList, self.BranchPathList):
             case_path = Path(case_path_text)
             record = self._ensure_case_record(record_map, case_path)
+            legacy_filter_complete = record.get('filter_mask_complete', 0)
+            legacy_filter_error = record.get('filter_mask_er_msg', '')
+            legacy_filter_fingerprint = record.get(
+                'filter_mask_fingerprint', ''
+            )
             case_rows = grouped_rows.get(
                 os.path.normcase(os.path.abspath(branch_path_text)), []
             )
-            if not case_rows:
-                record['filter_mask_complete'] = 0
-                record['filter_mask_er_msg'] = 'No Filter Mask rows for this case'
-                for artery in self.SelectedArteries:
-                    complete_field, message_field, fingerprint_field = (
-                        _filter_mask_status_fields(artery)
-                    )
-                    record[complete_field] = 0
-                    record[message_field] = 'No Filter Mask row for {0}'.format(
-                        artery
-                    )
-                    record[fingerprint_field] = ''
-                self._invalidate_filter_dependents(
-                    record, 'Filter Mask has no rows for this case'
-                )
-                outcomes[str(case_path)] = {
-                    'complete': False,
-                    'skipped': False,
-                    'error_message': 'No Filter Mask rows for this case',
-                }
-                self._save_xsection_record_map(record_map)
-                continue
-
-            expected_paths = []
+            artery_rows = {}
             artery_expected_paths = {}
             artery_fingerprint_parts = {}
+            artery_preflight_errors = {
+                artery: [] for artery in self.SelectedArteries
+            }
             fingerprint_parts = ['filter-mask-v1']
-            preflight_errors = []
+            case_preflight_errors = []
             source_signatures = {}
             for row in case_rows:
                 mask_path = Path(str(row.get('MaskPath', '')).strip())
@@ -1282,7 +1287,6 @@ class BatchSliceRadiomics:
                 expected_non_value_path = output_folder / (
                     file_name_reference + 'NVl.nii.gz'
                 )
-                expected_paths.extend((expected_path, expected_non_value_path))
                 artery = next((
                     artery_name for artery_name in self.SelectedArteries
                     if file_name_reference.casefold().startswith(
@@ -1290,40 +1294,56 @@ class BatchSliceRadiomics:
                     )
                 ), None)
                 if artery is None:
-                    preflight_errors.append(
+                    case_preflight_errors.append(
                         'Cannot identify Filter Mask artery from FileNameRef: '
                         '{0}'.format(file_name_reference)
                     )
-                elif artery in artery_expected_paths:
-                    preflight_errors.append(
+                elif artery in artery_rows:
+                    artery_preflight_errors[artery].append(
                         'Duplicate Filter Mask row for {0}'.format(artery)
                     )
                 else:
+                    artery_rows[artery] = row
                     artery_expected_paths[artery] = (
                         expected_path, expected_non_value_path
                     )
                 if not _path_is_within(mask_path, case_path):
-                    preflight_errors.append(
+                    input_error = (
                         'Filter Mask input is outside case: {0}'.format(mask_path)
                     )
+                    if artery is None:
+                        case_preflight_errors.append(input_error)
+                    else:
+                        artery_preflight_errors[artery].append(input_error)
                 else:
                     valid_input, input_error = validate_nifti(
                         mask_path, require_nonzero=True
                     )
                     if not valid_input:
-                        preflight_errors.append(input_error)
+                        if artery is None:
+                            case_preflight_errors.append(input_error)
+                        else:
+                            artery_preflight_errors[artery].append(input_error)
                 if not _path_is_within(expected_path, case_path):
-                    preflight_errors.append(
+                    output_error = (
                         'Filter Mask output is outside case: {0}'.format(
                             expected_path
                         )
                     )
+                    if artery is None:
+                        case_preflight_errors.append(output_error)
+                    else:
+                        artery_preflight_errors[artery].append(output_error)
                 if not _path_is_within(expected_non_value_path, case_path):
-                    preflight_errors.append(
+                    output_error = (
                         'Filter Mask output is outside case: {0}'.format(
                             expected_non_value_path
                         )
                     )
+                    if artery is None:
+                        case_preflight_errors.append(output_error)
+                    else:
+                        artery_preflight_errors[artery].append(output_error)
                 mask_key = os.path.normcase(os.path.abspath(str(mask_path)))
                 if mask_key not in source_signatures:
                     source_signatures[mask_key] = _file_signature(
@@ -1354,196 +1374,272 @@ class BatchSliceRadiomics:
                 artery for artery in self.SelectedArteries
                 if artery not in artery_expected_paths
             ]
-            if missing_arteries:
-                preflight_errors.append(
-                    'No Filter Mask row for: {0}'.format(
-                        ', '.join(missing_arteries)
-                    )
+            for artery in missing_arteries:
+                artery_preflight_errors[artery].append(
+                    'No Filter Mask row for {0}'.format(artery)
                 )
-            outputs_valid = all(
-                validate_nifti(path, require_nonzero=True)[0]
-                for path in expected_paths
-            )
-            matching_resume = (
-                not preflight_errors
-                and outputs_valid
-                and self._status_is_complete(record, 'filter_mask_complete')
-                and str(record.get('filter_mask_fingerprint', '')) == fingerprint
-            )
-            legacy_adoption = (
-                not preflight_errors
-                and outputs_valid
-                and not str(record.get('filter_mask_fingerprint', '')).strip()
-            )
-            if matching_resume or legacy_adoption:
-                record['filter_mask_complete'] = 1
-                record['filter_mask_er_msg'] = ''
-                record['filter_mask_fingerprint'] = fingerprint
-                for artery in self.SelectedArteries:
-                    complete_field, message_field, fingerprint_field = (
-                        _filter_mask_status_fields(artery)
-                    )
-                    record[complete_field] = 1
-                    record[message_field] = ''
-                    record[fingerprint_field] = artery_fingerprints.get(
-                        artery, ''
-                    )
-                outcomes[str(case_path)] = {
-                    'complete': True,
-                    'skipped': True,
-                    'error_message': '',
-                }
-                self._save_xsection_record_map(record_map)
-                continue
-            if preflight_errors:
-                message = _clean_error_message('; '.join(preflight_errors))
-                record['filter_mask_complete'] = 0
-                record['filter_mask_er_msg'] = message
-                record['filter_mask_fingerprint'] = fingerprint
-                for artery in self.SelectedArteries:
-                    complete_field, message_field, fingerprint_field = (
-                        _filter_mask_status_fields(artery)
-                    )
-                    record[complete_field] = 0
-                    record[message_field] = message
-                    record[fingerprint_field] = artery_fingerprints.get(
-                        artery, ''
-                    )
-                self._invalidate_filter_dependents(
-                    record, 'Filter Mask preflight failed: {0}'.format(message)
-                )
-                outcomes[str(case_path)] = {
-                    'complete': False,
-                    'skipped': False,
-                    'error_message': message,
-                }
-                self._save_xsection_record_map(record_map)
-                continue
-
-            record['filter_mask_complete'] = 0
-            record['filter_mask_er_msg'] = (
-                'Filter Mask started but did not finish.'
-            )
             record['filter_mask_fingerprint'] = fingerprint
+            artery_outcomes = {}
             for artery in self.SelectedArteries:
                 complete_field, message_field, fingerprint_field = (
                     _filter_mask_status_fields(artery)
                 )
+                artery_fingerprint = artery_fingerprints.get(artery)
+                if not artery_fingerprint:
+                    artery_fingerprint = _fingerprint((
+                        'filter-mask-artery-v1',
+                        'missing-row',
+                        str(case_path.resolve()),
+                        artery,
+                    ))
+                expected_paths = artery_expected_paths.get(artery, ())
+                preflight_errors = artery_preflight_errors[artery]
+                artery_status_known = bool(
+                    self._status_is_complete(record, complete_field)
+                    or str(record.get(message_field, '')).strip()
+                    or str(record.get(fingerprint_field, '')).strip()
+                )
+                if artery_status_known:
+                    previous_complete = record.get(complete_field, 0)
+                    previous_error = record.get(message_field, '')
+                    previous_fingerprint = record.get(fingerprint_field, '')
+                else:
+                    # Older ledgers stored only one case-level Filter Mask
+                    # result.  Its fingerprint is not comparable with the
+                    # newer per-artery fingerprint, so keep it unknown.
+                    previous_complete = legacy_filter_complete
+                    previous_error = legacy_filter_error
+                    previous_fingerprint = ''
+                    if str(previous_error).strip().startswith(
+                            FILTER_MASK_INTERRUPTED_MESSAGE.rstrip('.')):
+                        previous_error = FILTER_MASK_INTERRUPTED_MESSAGE
+                resume_state = self._resume_state(
+                    previous_complete,
+                    False,
+                    previous_error,
+                    previous_fingerprint,
+                    artery_fingerprint,
+                    FILTER_MASK_INTERRUPTED_MESSAGE,
+                )
+                outputs_valid = bool(expected_paths) and all(
+                    validate_nifti(path, require_nonzero=True)[0]
+                    for path in expected_paths
+                )
+                matching_resume = (
+                    resume_state == 'complete'
+                    and not preflight_errors
+                    and outputs_valid
+                    and self._status_is_complete(record, complete_field)
+                    and str(record.get(fingerprint_field, '')) == artery_fingerprint
+                )
+                legacy_adoption = (
+                    resume_state in ('complete', 'pending')
+                    and not preflight_errors
+                    and outputs_valid
+                    and not str(record.get(fingerprint_field, '')).strip()
+                )
+                if matching_resume or legacy_adoption:
+                    record[complete_field] = 1
+                    record[message_field] = ''
+                    record[fingerprint_field] = artery_fingerprint
+                    artery_outcomes[artery] = {
+                        'complete': True,
+                        'skipped': True,
+                        'error_message': '',
+                    }
+                    skipped_arteries += 1
+                    self._save_xsection_record_map(record_map)
+                    continue
+
+                if resume_state == 'failed' and not self.RerunFailedFlag:
+                    artery_outcomes[artery] = {
+                        'complete': False,
+                        'skipped': True,
+                        'failed_skipped': True,
+                        'legacy_failed_skip': not artery_status_known,
+                        'error_message': str(previous_error),
+                    }
+                    skipped_failed_arteries += 1
+                    incomplete_arteries += 1
+                    continue
+
+                if preflight_errors:
+                    message = _clean_error_message('; '.join(preflight_errors))
+                    record['filter_mask_complete'] = 0
+                    record['filter_mask_er_msg'] = message
+                    record[complete_field] = 0
+                    record[message_field] = message
+                    record[fingerprint_field] = artery_fingerprint
+                    self._invalidate_filter_dependents(
+                        record,
+                        'Filter Mask preflight failed: {0}'.format(message),
+                        arteries=(artery,),
+                    )
+                    artery_outcomes[artery] = {
+                        'complete': False,
+                        'skipped': False,
+                        'error_message': message,
+                    }
+                    incomplete_arteries += 1
+                    self._save_xsection_record_map(record_map)
+                    continue
+
+                record['filter_mask_complete'] = 0
+                record['filter_mask_er_msg'] = (
+                    'Filter Mask started but did not finish: {0}.'.format(
+                        artery
+                    )
+                )
                 record[complete_field] = 0
                 record[message_field] = (
-                    'Filter Mask started but did not finish.'
+                    FILTER_MASK_INTERRUPTED_MESSAGE
                 )
-                record[fingerprint_field] = artery_fingerprints.get(artery, '')
-            self._invalidate_filter_dependents(
-                record, 'Filter Mask requires downstream regeneration'
-            )
-            self._save_xsection_record_map(record_map)
-            file_descriptor, temporary_name = tempfile.mkstemp(
-                prefix='.filter_mask_{0}.'.format(case_path.name),
-                suffix='.csv',
-                dir=str(self.TableDir),
-                text=True,
-            )
-            os.close(file_descriptor)
-            temporary_path = Path(temporary_name)
-            try:
-                self._write_table(
-                    temporary_path, self.FILTER_MASK_HEADERS, case_rows
+                record[fingerprint_field] = artery_fingerprint
+                self._invalidate_filter_dependents(
+                    record,
+                    FILTER_MASK_REGENERATION_MESSAGE,
+                    arteries=(artery,),
                 )
-                if self._filter_mask_runner is not None:
-                    self._filter_mask_runner(str(temporary_path))
-                elif self.model is not None and hasattr(self.model, 'filterMask'):
-                    self.model.filterMask.BatchProcessing(str(temporary_path))
-                else:
-                    raise RuntimeError('Filter Mask processor is unavailable')
-                invalid_output_errors = []
-                artery_outcomes = {}
-                for artery in self.SelectedArteries:
-                    complete_field, message_field, fingerprint_field = (
-                        _filter_mask_status_fields(artery)
+                self._save_xsection_record_map(record_map)
+
+                pre_output_signatures = {
+                    path: _file_signature(path) for path in expected_paths
+                }
+                file_descriptor, temporary_name = tempfile.mkstemp(
+                    prefix='.filter_mask_{0}_{1}.'.format(
+                        case_path.name, artery
+                    ),
+                    suffix='.csv',
+                    dir=str(self.TableDir),
+                    text=True,
+                )
+                os.close(file_descriptor)
+                temporary_path = Path(temporary_name)
+                message = ''
+                try:
+                    self._write_table(
+                        temporary_path,
+                        self.FILTER_MASK_HEADERS,
+                        [artery_rows[artery]],
                     )
-                    artery_errors = []
-                    for path in artery_expected_paths.get(artery, ()):
+                    if self._filter_mask_runner is not None:
+                        self._filter_mask_runner(str(temporary_path))
+                    elif (self.model is not None
+                          and hasattr(self.model, 'filterMask')):
+                        self.model.filterMask.BatchProcessing(
+                            str(temporary_path)
+                        )
+                    else:
+                        raise RuntimeError('Filter Mask processor is unavailable')
+                    output_errors = []
+                    for path in expected_paths:
                         output_valid, validation_error = validate_nifti_after_write(
                             path, require_nonzero=True
                         )
+                        pre_output_signature = pre_output_signatures[path]
+                        if (
+                                pre_output_signature.split(':', 1)[0] != 'missing'
+                                and _file_signature(path) == pre_output_signature):
+                            output_valid = False
+                            validation_error = (
+                                'Filter Mask output was not updated by this run: '
+                                '{0}'.format(path)
+                            )
                         if not output_valid:
-                            artery_errors.append(validation_error)
-                    artery_complete = bool(
-                        artery in artery_expected_paths and not artery_errors
+                            output_errors.append(validation_error)
+                    message = _clean_error_message('; '.join(output_errors))
+                except Exception as error:
+                    message = _clean_error_message(error)
+                finally:
+                    if temporary_path.exists():
+                        temporary_path.unlink()
+
+                artery_complete = not bool(message)
+                record[complete_field] = int(artery_complete)
+                record[message_field] = message
+                record[fingerprint_field] = artery_fingerprint
+                artery_outcomes[artery] = {
+                    'complete': artery_complete,
+                    'skipped': False,
+                    'error_message': message,
+                }
+                if artery_complete:
+                    completed_arteries += 1
+                else:
+                    incomplete_arteries += 1
+                    self._invalidate_filter_dependents(
+                        record,
+                        'Filter Mask output validation failed: {0}'.format(
+                            message
+                        ),
+                        arteries=(artery,),
                     )
-                    artery_message = _clean_error_message(
-                        '; '.join(artery_errors)
-                    )
-                    record[complete_field] = int(artery_complete)
-                    record[message_field] = artery_message
-                    record[fingerprint_field] = artery_fingerprints.get(
-                        artery, ''
-                    )
-                    artery_outcomes[artery] = {
-                        'complete': artery_complete,
-                        'error_message': artery_message,
-                    }
-                    if artery_message:
-                        invalid_output_errors.append(
-                            '{0}: {1}'.format(artery, artery_message)
+                    self.UpdateMsgLog(
+                        'Filter Mask failed; continuing: {0}/{1}: {2}'.format(
+                            case_path.name, artery, message
                         )
-                        self._invalidate_filter_dependents(
-                            record,
-                            'Filter Mask output validation failed: {0}'.format(
-                                artery_message
-                            ),
-                            arteries=(artery,),
-                        )
+                    )
+                self._save_xsection_record_map(record_map)
+
+            artery_messages = [
+                '{0}: {1}'.format(
+                    artery, artery_outcomes[artery]['error_message']
+                )
+                for artery in self.SelectedArteries
+                if artery_outcomes[artery]['error_message']
+            ]
+            artery_messages.extend(case_preflight_errors)
+            if case_preflight_errors:
+                table_error_cases += 1
+            preserve_legacy_failure = bool(self.SelectedArteries) and all(
+                artery_outcomes[artery].get('legacy_failed_skip', False)
+                for artery in self.SelectedArteries
+            )
+            if preserve_legacy_failure:
+                record['filter_mask_complete'] = legacy_filter_complete
+                record['filter_mask_er_msg'] = legacy_filter_error
+                record['filter_mask_fingerprint'] = legacy_filter_fingerprint
+            else:
                 record['filter_mask_complete'] = int(
-                    all(
+                    not case_preflight_errors and all(
                         artery_outcomes[artery]['complete']
                         for artery in self.SelectedArteries
                     )
                 )
                 record['filter_mask_er_msg'] = _clean_error_message(
-                    '; '.join(invalid_output_errors)
+                    '; '.join(artery_messages)
                 )
-                outcomes[str(case_path)] = {
-                    'complete': bool(record['filter_mask_complete']),
-                    'skipped': False,
-                    'error_message': record['filter_mask_er_msg'],
-                    'arteries': artery_outcomes,
-                }
-                if invalid_output_errors:
-                    self.UpdateMsgLog(
-                        'Filter Mask failed for individual arteries; continuing: '
-                        '{0}: {1}'.format(
-                            case_path.name, record['filter_mask_er_msg']
-                        )
+                record['filter_mask_fingerprint'] = fingerprint
+            outcomes[str(case_path)] = {
+                'complete': self._status_is_complete(
+                    record, 'filter_mask_complete'
+                ),
+                'skipped': bool(
+                    self.SelectedArteries and all(
+                        artery_outcomes[artery]['skipped']
+                        for artery in self.SelectedArteries
                     )
-            except Exception as error:
-                message = _clean_error_message(error)
-                record['filter_mask_complete'] = 0
-                record['filter_mask_er_msg'] = message
-                for artery in self.SelectedArteries:
-                    complete_field, message_field, fingerprint_field = (
-                        _filter_mask_status_fields(artery)
-                    )
-                    record[complete_field] = 0
-                    record[message_field] = message
-                    record[fingerprint_field] = artery_fingerprints.get(
-                        artery, ''
-                    )
-                outcomes[str(case_path)] = {
-                    'complete': False,
-                    'skipped': False,
-                    'error_message': message,
-                }
-                self.UpdateMsgLog(
-                    'Filter Mask failed; continuing: {0}: {1}'.format(
-                        case_path.name, message
-                    )
-                )
-            finally:
-                if temporary_path.exists():
-                    temporary_path.unlink()
+                ),
+                'failed_skipped': any(
+                    artery_outcomes[artery].get('failed_skipped', False)
+                    for artery in self.SelectedArteries
+                ),
+                'error_message': record['filter_mask_er_msg'],
+                'arteries': artery_outcomes,
+            }
             self._save_xsection_record_map(record_map)
+
+        self.UpdateMsgLog(
+            'Filter Mask resume summary: skipped complete {0}, skipped failed '
+            '{1}, completed {2}, incomplete {3} artery outputs; table-error '
+            'cases {4}.'.format(
+                skipped_arteries,
+                skipped_failed_arteries,
+                completed_arteries,
+                incomplete_arteries,
+                table_error_cases,
+            )
+        )
         return outcomes
 
     @staticmethod
@@ -1637,6 +1733,56 @@ class BatchSliceRadiomics:
     @staticmethod
     def _status_is_complete(record, field_name):
         return str(record.get(field_name, '0')).strip() == '1'
+
+    @staticmethod
+    def _resume_state(
+            complete,
+            failed,
+            error_message,
+            stored_fingerprint,
+            current_fingerprint,
+            interrupted_message,
+            pending_messages=()):
+        """Classify one persisted task without changing its record.
+
+        A non-empty changed fingerprint represents new work, while a blank
+        legacy fingerprint cannot prove that the failed task has changed.
+        Interruption sentinels take precedence over pessimistic failure bits
+        written immediately before an external process starts.
+        """
+
+        error_message = str(error_message or '').strip()
+        stored_fingerprint = str(stored_fingerprint or '').strip()
+        current_fingerprint = str(current_fingerprint or '').strip()
+        failed = failed is True or str(failed or '0').strip() == '1'
+        complete = complete is True or str(complete or '0').strip() == '1'
+
+        if (
+                stored_fingerprint
+                and current_fingerprint
+                and stored_fingerprint != current_fingerprint):
+            return 'changed'
+        pending_messages = set(pending_messages or ())
+        error_parts = [
+            part.strip() for part in error_message.split(';') if part.strip()
+        ]
+        if (
+                error_message == interrupted_message
+                or (
+                    interrupted_message in error_parts
+                    and all(
+                        part == interrupted_message or part in pending_messages
+                        for part in error_parts
+                    )
+                )):
+            return 'interrupted'
+        if error_parts and all(part in pending_messages for part in error_parts):
+            return 'pending'
+        if failed or error_message:
+            return 'failed'
+        if complete:
+            return 'complete'
+        return 'pending'
 
     def _update_case_aggregates(self, record):
         selected = list(self.SelectedArteries)
@@ -1904,8 +2050,38 @@ class BatchSliceRadiomics:
 
                     job = jobs.get((case_key, artery, artifact_type))
                     if job is None:
+                        missing_job_fingerprint = _fingerprint((
+                            'xsection-v1',
+                            'missing-row',
+                            str(case_path.resolve()),
+                            artery,
+                            artifact_type,
+                        ))
+                        missing_job_state = self._resume_state(
+                            record.get(complete_field, 0),
+                            record.get(failed_field, 0),
+                            record.get(message_field, ''),
+                            record.get(fingerprint_field, ''),
+                            missing_job_fingerprint,
+                            XSECTION_INTERRUPTED_MESSAGE,
+                            (
+                                (FILTER_MASK_REGENERATION_MESSAGE,)
+                                if artifact_type == 'seg' else ()
+                            ),
+                        )
+                        if (
+                                missing_job_state == 'failed'
+                                and not self.RerunFailedFlag):
+                            outcomes[(case_path.name, artery, artifact_type)] = {
+                                'complete': False,
+                                'skipped': True,
+                                'failed_skipped': True,
+                                'error_message': record.get(message_field, ''),
+                            }
+                            continue
                         record[failed_field] = 0
                         record[complete_field] = 0
+                        record[fingerprint_field] = missing_job_fingerprint
                         error_message = (
                             'No {0} Xsection table row for {1}'.format(
                                 artifact_type, artery
@@ -1933,6 +2109,32 @@ class BatchSliceRadiomics:
                         self._invalidate_lumen_dependency(
                             record, artery, error_message
                         )
+                        outcomes[(case_path.name, artery, artifact_type)] = {
+                            'complete': False,
+                            'skipped': False,
+                            'error_message': error_message,
+                        }
+                        continue
+
+                    resume_state = self._resume_state(
+                        record.get(complete_field, 0),
+                        record.get(failed_field, 0),
+                        record.get(message_field, ''),
+                        record.get(fingerprint_field, ''),
+                        job['fingerprint'],
+                        XSECTION_INTERRUPTED_MESSAGE,
+                        (
+                            (FILTER_MASK_REGENERATION_MESSAGE,)
+                            if artifact_type == 'seg' else ()
+                        ),
+                    )
+                    if resume_state == 'failed' and not self.RerunFailedFlag:
+                        outcomes[(case_path.name, artery, artifact_type)] = {
+                            'complete': False,
+                            'skipped': True,
+                            'failed_skipped': True,
+                            'error_message': record.get(message_field, ''),
+                        }
                         continue
 
                     dependency_error = ''
@@ -1984,13 +2186,15 @@ class BatchSliceRadiomics:
                     preflight_error = self._xsection_preflight_error(job)
 
                     matching_resume = (
-                        not preflight_error
+                        resume_state == 'complete'
+                        and not preflight_error
                         and valid_output
                         and self._status_is_complete(record, complete_field)
                         and str(record.get(fingerprint_field, '')) == job['fingerprint']
                     )
                     legacy_adoption = (
-                        not preflight_error
+                        resume_state in ('complete', 'pending')
+                        and not preflight_error
                         and valid_output
                         and not str(record.get(fingerprint_field, '')).strip()
                     )
@@ -2040,16 +2244,16 @@ class BatchSliceRadiomics:
                         continue
 
                     record[failed_field] = 1
-                    record[message_field] = (
-                        'Xsection process started but did not finish.'
-                    )
+                    record[message_field] = XSECTION_INTERRUPTED_MESSAGE
                     record[complete_field] = 0
                     record[fingerprint_field] = job['fingerprint']
                     self._invalidate_lumen_dependency(
                         record,
                         artery,
-                        '{0} xsection requires Lumen Correction regeneration'.format(
-                            artifact_type
+                        (
+                            CTA_REGENERATION_MESSAGE
+                            if artifact_type == 'CTA'
+                            else SEG_REGENERATION_MESSAGE
                         ),
                     )
                     job['pre_output_signature'] = _file_signature(output_path)
@@ -2151,6 +2355,27 @@ class BatchSliceRadiomics:
             self._update_case_aggregates(record)
         self._save_xsection_record_map(record_map)
         self._merge_xsection_records()
+        skipped_complete = sum(
+            1 for outcome in outcomes.values()
+            if outcome.get('complete') and outcome.get('skipped')
+        )
+        skipped_failed = sum(
+            1 for outcome in outcomes.values()
+            if outcome.get('failed_skipped')
+        )
+        incomplete = sum(
+            1 for outcome in outcomes.values()
+            if not outcome.get('complete')
+        )
+        self.UpdateMsgLog(
+            'Xsection resume summary: skipped complete {0}, skipped failed '
+            '{1}, submitted {2}, incomplete {3}.'.format(
+                skipped_complete,
+                skipped_failed,
+                len(pending_jobs),
+                incomplete,
+            )
+        )
         return outcomes
 
     def _run_lumen_table(self, table_path):
@@ -2188,6 +2413,7 @@ class BatchSliceRadiomics:
 
         record_map = self._load_xsection_record_map()
         outcomes = {}
+        submitted_corrections = 0
         for case_path_text in self.DCMDirList:
             case_path = Path(case_path_text)
             case_key = self._record_key(self.BatchName, case_path.name)
@@ -2214,10 +2440,45 @@ class BatchSliceRadiomics:
                 fingerprint_field = '{0}_lumen_fingerprint'.format(artery)
                 row_entry = row_map.get((case_key, artery))
                 if row_entry is None:
+                    missing_row_fingerprint = _fingerprint((
+                        'lumen-v1',
+                        'missing-row',
+                        str(case_path.resolve()),
+                        artery,
+                    ))
+                    missing_row_state = self._resume_state(
+                        record.get(complete_field, 0),
+                        False,
+                        record.get(message_field, ''),
+                        record.get(fingerprint_field, ''),
+                        missing_row_fingerprint,
+                        LUMEN_INTERRUPTED_MESSAGE,
+                        (
+                            FILTER_MASK_REGENERATION_MESSAGE,
+                            CTA_REGENERATION_MESSAGE,
+                            SEG_REGENERATION_MESSAGE,
+                        ),
+                    )
+                    if (
+                            missing_row_state == 'failed'
+                            and not self.RerunFailedFlag):
+                        outcomes[(case_path.name, artery)] = {
+                            'complete': False,
+                            'skipped': True,
+                            'failed_skipped': True,
+                            'error_message': record.get(message_field, ''),
+                        }
+                        continue
                     record[complete_field] = 0
+                    record[fingerprint_field] = missing_row_fingerprint
                     record[message_field] = (
                         'No Lumen Correction table row for {0}'.format(artery)
                     )
+                    outcomes[(case_path.name, artery)] = {
+                        'complete': False,
+                        'skipped': False,
+                        'error_message': record[message_field],
+                    }
                     continue
                 _, row = row_entry
                 image_path = Path(str(row['Image Path']))
@@ -2239,6 +2500,27 @@ class BatchSliceRadiomics:
                 valid_output, output_validation_error = validate_nifti(
                     output_path, require_nonzero=True
                 )
+                resume_state = self._resume_state(
+                    record.get(complete_field, 0),
+                    False,
+                    record.get(message_field, ''),
+                    record.get(fingerprint_field, ''),
+                    fingerprint,
+                    LUMEN_INTERRUPTED_MESSAGE,
+                    (
+                        FILTER_MASK_REGENERATION_MESSAGE,
+                        CTA_REGENERATION_MESSAGE,
+                        SEG_REGENERATION_MESSAGE,
+                    ),
+                )
+                if resume_state == 'failed' and not self.RerunFailedFlag:
+                    outcomes[(case_path.name, artery)] = {
+                        'complete': False,
+                        'skipped': True,
+                        'failed_skipped': True,
+                        'error_message': record.get(message_field, ''),
+                    }
+                    continue
                 dependency_error = ''
                 if not source_valid:
                     dependency_error = source_validation_error
@@ -2322,13 +2604,15 @@ class BatchSliceRadiomics:
                     and process_valid
                 )
                 matching_resume = (
-                    resume_inputs_valid
+                    resume_state == 'complete'
+                    and resume_inputs_valid
                     and valid_output
                     and self._status_is_complete(record, complete_field)
                     and str(record.get(fingerprint_field, '')) == fingerprint
                 )
                 legacy_adoption = (
-                    resume_inputs_valid
+                    resume_state in ('complete', 'pending')
+                    and resume_inputs_valid
                     and valid_output
                     and not str(record.get(fingerprint_field, '')).strip()
                 )
@@ -2429,12 +2713,11 @@ class BatchSliceRadiomics:
                     continue
 
                 record[complete_field] = 0
-                record[message_field] = (
-                    'Lumen Correction started but did not finish.'
-                )
+                record[message_field] = LUMEN_INTERRUPTED_MESSAGE
                 record[fingerprint_field] = fingerprint
                 self._update_case_aggregates(record)
                 self._save_xsection_record_map(record_map)
+                submitted_corrections += 1
                 pre_output_signature = _file_signature(output_path)
 
                 file_descriptor, temporary_name = tempfile.mkstemp(
@@ -2505,6 +2788,27 @@ class BatchSliceRadiomics:
             self._save_xsection_record_map(record_map)
 
         self._merge_xsection_records()
+        skipped_complete = sum(
+            1 for outcome in outcomes.values()
+            if outcome.get('complete') and outcome.get('skipped')
+        )
+        skipped_failed = sum(
+            1 for outcome in outcomes.values()
+            if outcome.get('failed_skipped')
+        )
+        incomplete = sum(
+            1 for outcome in outcomes.values()
+            if not outcome.get('complete')
+        )
+        self.UpdateMsgLog(
+            'Lumen Correction resume summary: skipped complete {0}, skipped '
+            'failed {1}, submitted {2}, incomplete {3}.'.format(
+                skipped_complete,
+                skipped_failed,
+                submitted_corrections,
+                incomplete,
+            )
+        )
         return outcomes
 
 
@@ -2565,7 +2869,15 @@ class BatchSliceRadiomics:
     def mainFunction(self):
         self.initProcess()
         self.CheckCheckBoxStatus()
+        if not self.SelectedArteries:
+            raise ValueError('Select at least one artery before running the batch')
         self._configure_from_ui()
+        self.UpdateMsgLog(
+            'Resume policy: completed work is validated and skipped; unchanged '
+            'failed work will {0}.'.format(
+                'be retried' if self.RerunFailedFlag else 'remain skipped'
+            )
+        )
         run_lock_path = (
             Path(self.TableDir) / XSECTION_RECORD_FOLDER / 'batch_run.lock'
         )
@@ -2599,6 +2911,13 @@ class BatchSliceRadiomics:
                 self.CreateFoldersDCM()
             self.StoreListInformation()
             self._initialize_case_records()
+
+            if self.MaskXsectionOnlyFlag and self.LCFlag:
+                self.UpdateMsgLog(
+                    'Mask xsections only: CTA xsections will not be generated. '
+                    'Lumen Correction will use existing valid CTA xsections; '
+                    'arteries without one will be recorded incomplete.'
+                )
 
             if self.BranchDictFlag:
                 self.UpdateMsgLog('Write artery dictionary start')

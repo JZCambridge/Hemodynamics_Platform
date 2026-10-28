@@ -876,6 +876,19 @@ p, li { white-space: pre-wrap; }
                <number>5</number>
               </property>
               <item>
+               <widget class="QCheckBox" name="RerunFailedCases_CB_BSRJZ">
+                <property name="toolTip">
+                 <string>Unchecked: skip completed and unchanged failed cases; resume new, changed, or interrupted work. Checked: retry failed cases too.</string>
+                </property>
+                <property name="text">
+                 <string>Also rerun failed cases</string>
+                </property>
+                <property name="checked">
+                 <bool>false</bool>
+                </property>
+               </widget>
+              </item>
+              <item>
                <widget class="QCheckBox" name="CopyFile_CB_BSRJZ">
                 <property name="text">
                  <string>Copy Files</string>

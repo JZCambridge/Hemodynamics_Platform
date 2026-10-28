@@ -6,8 +6,10 @@ from pathlib import Path
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest import mock
+import xml.etree.ElementTree as ElementTree
 
 import numpy
 import SimpleITK as sitk
@@ -66,6 +68,14 @@ def read_csv(path):
 def read_csv_header(path):
     with Path(path).open("r", encoding="utf-8-sig", newline="") as csv_file:
         return list(csv.DictReader(csv_file).fieldnames or [])
+
+
+class CheckBoxStub:
+    def __init__(self, checked):
+        self.checked = bool(checked)
+
+    def isChecked(self):
+        return self.checked
 
 
 def write_nifti(path, nonzero=True, value=1):
@@ -297,6 +307,81 @@ def make_controller(
     controller.StoreListInformation()
     controller._prepare_lumen_process()
     return controller, case_paths, runner, correction_runner
+
+
+class ResumePolicyTests(unittest.TestCase):
+    def test_resume_state_matrix(self):
+        classify = BatchSliceRadiomicsMain.BatchSliceRadiomics._resume_state
+        interrupted = BatchSliceRadiomicsMain.XSECTION_INTERRUPTED_MESSAGE
+
+        self.assertEqual(
+            classify(0, 0, "", "", "current", interrupted),
+            "pending",
+        )
+        self.assertEqual(
+            classify(1, 0, "", "same", "same", interrupted),
+            "complete",
+        )
+        self.assertEqual(
+            classify(0, 1, "vendor failed", "same", "same", interrupted),
+            "failed",
+        )
+        self.assertEqual(
+            classify(0, 1, interrupted, "same", "same", interrupted),
+            "interrupted",
+        )
+        self.assertEqual(
+            classify(
+                0,
+                0,
+                BatchSliceRadiomicsMain.FILTER_MASK_REGENERATION_MESSAGE,
+                "same",
+                "same",
+                interrupted,
+                (BatchSliceRadiomicsMain.FILTER_MASK_REGENERATION_MESSAGE,),
+            ),
+            "pending",
+        )
+        self.assertEqual(
+            classify(
+                0,
+                1,
+                interrupted + "; "
+                + BatchSliceRadiomicsMain.FILTER_MASK_REGENERATION_MESSAGE,
+                "same",
+                "same",
+                interrupted,
+                (BatchSliceRadiomicsMain.FILTER_MASK_REGENERATION_MESSAGE,),
+            ),
+            "interrupted",
+        )
+        self.assertEqual(
+            classify(0, 1, "vendor failed", "old", "new", interrupted),
+            "changed",
+        )
+        self.assertEqual(
+            classify(0, 0, "legacy failure", "", "new", interrupted),
+            "failed",
+        )
+
+    def test_rerun_failed_checkbox_is_explicitly_unchecked_and_read(self):
+        ui_path = GUI_ROOT / "ui" / "BatchSliceRadiomics.ui"
+        root = ElementTree.parse(str(ui_path)).getroot()
+        widget = root.find(
+            ".//widget[@name='RerunFailedCases_CB_BSRJZ']"
+        )
+        self.assertIsNotNone(widget)
+        checked = widget.find("./property[@name='checked']/bool")
+        self.assertIsNotNone(checked)
+        self.assertEqual((checked.text or "").strip().lower(), "false")
+
+        controller = BatchSliceRadiomicsMain.BatchSliceRadiomics()
+        self.assertFalse(controller.RerunFailedFlag)
+        controller.ui = SimpleNamespace(
+            RerunFailedCases_CB_BSRJZ=CheckBoxStub(True)
+        )
+        controller.CheckCheckBoxStatus()
+        self.assertTrue(controller.RerunFailedFlag)
 
 
 class NiftiValidationTests(unittest.TestCase):
@@ -1326,8 +1411,10 @@ class BatchSliceRadiomicsControllerTests(unittest.TestCase):
             first_filter_outcomes = controller.BatchFilterMask()
             first_xsection_outcomes = controller.BatchXsection()
 
-            self.assertEqual(len(filter_runner.calls), 1)
-            self.assertEqual(filter_runner.calls[0]["row_count"], 3)
+            self.assertEqual(len(filter_runner.calls), 3)
+            self.assertTrue(
+                all(call["row_count"] == 1 for call in filter_runner.calls)
+            )
             self.assertEqual(len(xsection_runner.calls), 6)
             self.assertTrue(
                 all(value["complete"] for value in first_filter_outcomes.values())
@@ -1513,7 +1600,7 @@ class BatchSliceRadiomicsControllerTests(unittest.TestCase):
             xsection_outcomes = controller.BatchXsection()
             lumen_outcomes = controller.BatchLumenCorrection()
 
-            self.assertEqual(filter_calls, [3])
+            self.assertEqual(filter_calls, [1, 1, 1])
             self.assertFalse(filter_outcomes[str(case_path)]["complete"])
             self.assertFalse(
                 filter_outcomes[str(case_path)]["arteries"]["mLAD"]["complete"]
@@ -1557,6 +1644,161 @@ class BatchSliceRadiomicsControllerTests(unittest.TestCase):
             self.assertEqual(record["mLAD_lumen_complete"], "0")
             self.assertEqual(record["LCx_lumen_complete"], "1")
             self.assertEqual(record["mRCA_lumen_complete"], "1")
+
+    def test_filter_mask_resume_reruns_only_the_missing_artery(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            filter_runner = RecordingFilterMaskRunner()
+            controller, case_paths, _, _ = make_controller(
+                temporary_directory,
+                filter_mask_runner=filter_runner,
+            )
+            case_path = case_paths[0]
+            branch_path = case_path / "Preproc" / "OriData" / "Branches"
+            for artery in controller.SelectedArteries:
+                (branch_path / (artery + "_OriB_Val.nii.gz")).unlink()
+            controller.GenerateTable(maskXsection=True, maskXsectionOnly=False)
+
+            first_outcomes = controller.BatchFilterMask()
+
+            self.assertTrue(first_outcomes[str(case_path)]["complete"])
+            self.assertEqual(len(filter_runner.calls), 3)
+            preserved_paths = [
+                branch_path / "LCx_OriB_Val.nii.gz",
+                branch_path / "LCx_OriB_NVl.nii.gz",
+                branch_path / "mRCA_OriB_Val.nii.gz",
+                branch_path / "mRCA_OriB_NVl.nii.gz",
+            ]
+            preserved_bytes = {
+                path: path.read_bytes() for path in preserved_paths
+            }
+            (branch_path / "mLAD_OriB_Val.nii.gz").unlink()
+            filter_runner.calls = []
+            controller.GenerateTable(maskXsection=True, maskXsectionOnly=False)
+
+            resumed_outcomes = controller.BatchFilterMask()
+
+            self.assertEqual(len(filter_runner.calls), 1)
+            self.assertEqual(
+                filter_runner.calls[0]["file_names"], ["mLAD_OriB_"]
+            )
+            for path, expected_bytes in preserved_bytes.items():
+                self.assertEqual(path.read_bytes(), expected_bytes)
+            case_outcome = resumed_outcomes[str(case_path)]
+            self.assertTrue(case_outcome["complete"])
+            self.assertTrue(case_outcome["arteries"]["LCx"]["skipped"])
+            self.assertFalse(case_outcome["arteries"]["mLAD"]["skipped"])
+            self.assertTrue(case_outcome["arteries"]["mRCA"]["skipped"])
+
+    def test_filter_mask_noop_runner_cannot_adopt_stale_outputs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            initial_runner = RecordingFilterMaskRunner()
+            controller, case_paths, _, _ = make_controller(
+                temporary_directory,
+                selected_arteries=("LCx",),
+                filter_mask_runner=initial_runner,
+            )
+            case_path = case_paths[0]
+            branch_path = case_path / "Preproc" / "OriData" / "Branches"
+            (branch_path / "LCx_OriB_Val.nii.gz").unlink()
+            controller.GenerateTable(maskXsection=True, maskXsectionOnly=False)
+            self.assertTrue(
+                controller.BatchFilterMask()[str(case_path)]["complete"]
+            )
+
+            source_segmentation = (
+                case_path
+                / "Preproc"
+                / "OriData"
+                / "sc_labelled_coronary_segment.nii.gz"
+            )
+            write_nifti(source_segmentation, nonzero=True, value=7)
+            noop_calls = []
+
+            def noop_runner(table_path):
+                noop_calls.append(read_csv(table_path)[0]["FileNameRef"])
+
+            controller._filter_mask_runner = noop_runner
+            controller.GenerateTable(maskXsection=True, maskXsectionOnly=False)
+
+            outcomes = controller.BatchFilterMask()
+
+            self.assertEqual(noop_calls, ["LCx_OriB_"])
+            case_outcome = outcomes[str(case_path)]
+            self.assertFalse(case_outcome["complete"])
+            self.assertIn("was not updated by this run", case_outcome["error_message"])
+            record = read_csv(controller.XsectionRecordPath)[0]
+            self.assertEqual(record["filter_mask_complete"], "0")
+            self.assertEqual(record["LCx_filter_mask_complete"], "0")
+
+    def test_filter_mask_checkpoint_survives_interruption_between_arteries(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            calls = []
+
+            def interrupting_runner(table_path):
+                row = read_csv(table_path)[0]
+                file_name_reference = row["FileNameRef"]
+                calls.append(file_name_reference)
+                if file_name_reference == "mLAD_OriB_":
+                    raise KeyboardInterrupt("injected hard interruption")
+                output_folder = Path(row["OutputFolder"])
+                write_nifti(
+                    output_folder / (file_name_reference + "Val.nii.gz"),
+                    nonzero=True,
+                )
+                write_nifti(
+                    output_folder / (file_name_reference + "NVl.nii.gz"),
+                    nonzero=True,
+                )
+
+            controller, case_paths, _, _ = make_controller(
+                temporary_directory,
+                filter_mask_runner=interrupting_runner,
+            )
+            case_path = case_paths[0]
+            branch_path = case_path / "Preproc" / "OriData" / "Branches"
+            for artery in controller.SelectedArteries:
+                (branch_path / (artery + "_OriB_Val.nii.gz")).unlink()
+            controller.GenerateTable(maskXsection=True, maskXsectionOnly=False)
+
+            with self.assertRaises(KeyboardInterrupt):
+                controller.BatchFilterMask()
+
+            self.assertEqual(calls, ["LCx_OriB_", "mLAD_OriB_"])
+            interrupted_record = read_csv(controller.XsectionRecordPath)[0]
+            self.assertEqual(
+                interrupted_record["LCx_filter_mask_complete"], "1"
+            )
+            self.assertEqual(
+                interrupted_record["mLAD_filter_mask_complete"], "0"
+            )
+            self.assertEqual(interrupted_record["filter_mask_complete"], "0")
+
+            resume_runner = RecordingFilterMaskRunner()
+            controller._filter_mask_runner = resume_runner
+            resumed_outcomes = controller.BatchFilterMask()
+
+            self.assertEqual(
+                [call["file_names"] for call in resume_runner.calls],
+                [["mLAD_OriB_"], ["mRCA_OriB_"]],
+            )
+            case_outcome = resumed_outcomes[str(case_path)]
+            self.assertTrue(case_outcome["complete"])
+            self.assertTrue(case_outcome["arteries"]["LCx"]["skipped"])
+            completed_record = read_csv(controller.XsectionRecordPath)[0]
+            self.assertEqual(completed_record["filter_mask_complete"], "1")
+
+    def test_generate_table_requires_an_artery_selection(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, _, _, _ = make_controller(
+                temporary_directory,
+                selected_arteries=(),
+            )
+
+            with self.assertRaisesRegex(ValueError, "at least one artery"):
+                controller.GenerateTable(
+                    maskXsection=True,
+                    maskXsectionOnly=True,
+                )
 
     def test_lumen_snapshot_error_blocks_stale_process_and_records_incomplete(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1779,6 +2021,153 @@ class BatchSliceRadiomicsControllerTests(unittest.TestCase):
             self.assertEqual(record["LCx_xsection_seg_complete"], "1")
             self.assertEqual(record["complete_xsection_CTA"], "1")
             self.assertEqual(record["complete_xsection_seg"], "1")
+
+    def test_filter_failure_skips_by_default_and_checkbox_retries(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths, _, _ = make_controller(
+                temporary_directory,
+                selected_arteries=("LCx",),
+            )
+            case_path = case_paths[0]
+            controller.GenerateTable(maskXsection=True, maskXsectionOnly=False)
+            failing_runner = mock.Mock(
+                side_effect=RuntimeError("injected Filter Mask failure")
+            )
+            controller._filter_mask_runner = failing_runner
+
+            first = controller.BatchFilterMask()[str(case_path)]
+            self.assertFalse(first["complete"])
+            self.assertEqual(failing_runner.call_count, 1)
+
+            retry_runner = RecordingFilterMaskRunner()
+            controller._filter_mask_runner = retry_runner
+            skipped = controller.BatchFilterMask()[str(case_path)]
+            self.assertEqual(retry_runner.calls, [])
+            self.assertTrue(skipped["skipped"])
+            self.assertTrue(skipped["failed_skipped"])
+
+            controller.RerunFailedFlag = True
+            retried = controller.BatchFilterMask()[str(case_path)]
+            self.assertEqual(len(retry_runner.calls), 1)
+            self.assertTrue(retried["complete"])
+
+    def test_legacy_filter_failure_without_fingerprint_stays_skipped(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            runner = RecordingFilterMaskRunner()
+            controller, case_paths, _, _ = make_controller(
+                temporary_directory,
+                selected_arteries=("LCx",),
+                filter_mask_runner=runner,
+            )
+            case_path = case_paths[0]
+            controller.GenerateTable(maskXsection=True, maskXsectionOnly=False)
+            record_map = controller._load_xsection_record_map()
+            record = controller._ensure_case_record(record_map, case_path)
+            record["filter_mask_complete"] = 0
+            record["filter_mask_er_msg"] = "legacy case-level failure"
+            record["filter_mask_fingerprint"] = ""
+            controller._save_xsection_record_map(record_map)
+
+            outcome = controller.BatchFilterMask()[str(case_path)]
+
+            self.assertEqual(runner.calls, [])
+            self.assertFalse(outcome["complete"])
+            self.assertTrue(outcome["skipped"])
+            self.assertTrue(outcome["failed_skipped"])
+            saved = read_csv(controller.XsectionRecordPath)[0]
+            self.assertEqual(
+                saved["filter_mask_er_msg"], "legacy case-level failure"
+            )
+            self.assertEqual(saved["filter_mask_fingerprint"], "")
+
+    def test_xsection_failure_policy_and_changed_fingerprint(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            failing_runner = RecordingXsectionRunner(
+                {"LCxCTALI.nii.gz": "missing"}
+            )
+            controller, case_paths, _, _ = make_controller(
+                temporary_directory,
+                selected_arteries=("LCx",),
+                xsection_runner=failing_runner,
+            )
+            case_path = case_paths[0]
+            controller.MaskXsectionFlag = False
+            controller.MaskXsectionOnlyFlag = False
+            controller.GenerateTable(maskXsection=False, maskXsectionOnly=False)
+
+            first = controller.BatchXsection()[("CASE_001", "LCx", "CTA")]
+            self.assertFalse(first["complete"])
+            self.assertEqual(len(failing_runner.calls), 1)
+
+            retry_runner = RecordingXsectionRunner()
+            controller._xsection_runner = retry_runner
+            skipped = controller.BatchXsection()[
+                ("CASE_001", "LCx", "CTA")
+            ]
+            self.assertEqual(retry_runner.calls, [])
+            self.assertTrue(skipped["failed_skipped"])
+
+            checked_runner = RecordingXsectionRunner(
+                {"LCxCTALI.nii.gz": "missing"}
+            )
+            controller._xsection_runner = checked_runner
+            controller.RerunFailedFlag = True
+            controller.BatchXsection()
+            self.assertEqual(len(checked_runner.calls), 1)
+
+            controller.RerunFailedFlag = False
+            centerline_path = (
+                case_path / "Preproc" / "CSV" / "LCxExt.csv"
+            )
+            centerline_path.write_text(
+                "0,0,0\n1,1,1\n2,2,2\n",
+                encoding="utf-8",
+            )
+            changed_runner = RecordingXsectionRunner()
+            controller._xsection_runner = changed_runner
+            changed = controller.BatchXsection()[
+                ("CASE_001", "LCx", "CTA")
+            ]
+            self.assertEqual(len(changed_runner.calls), 1)
+            self.assertTrue(changed["complete"])
+
+    def test_lumen_failure_skips_by_default_and_checkbox_retries(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            xsection_runner = RecordingXsectionRunner()
+            failing_lumen = RecordingLumenRunner(
+                {"LCxValNNFixVal.nii.gz": "failure"}
+            )
+            controller, _, _, _ = make_controller(
+                temporary_directory,
+                selected_arteries=("LCx",),
+                xsection_runner=xsection_runner,
+                lumen_runner=failing_lumen,
+            )
+            controller.MaskXsectionFlag = True
+            controller.MaskXsectionOnlyFlag = False
+            controller.GenerateTable(maskXsection=True, maskXsectionOnly=False)
+            controller.BatchXsection()
+
+            first = controller.BatchLumenCorrection()[
+                ("CASE_001", "LCx")
+            ]
+            self.assertFalse(first["complete"])
+            self.assertEqual(len(failing_lumen.calls), 1)
+
+            retry_runner = RecordingLumenRunner()
+            controller._lumen_runner = retry_runner
+            skipped = controller.BatchLumenCorrection()[
+                ("CASE_001", "LCx")
+            ]
+            self.assertEqual(retry_runner.calls, [])
+            self.assertTrue(skipped["failed_skipped"])
+
+            controller.RerunFailedFlag = True
+            retried = controller.BatchLumenCorrection()[
+                ("CASE_001", "LCx")
+            ]
+            self.assertEqual(len(retry_runner.calls), 1)
+            self.assertTrue(retried["complete"])
 
 
 if __name__ == "__main__":
