@@ -6,6 +6,13 @@ Jin ZHENG JZ410 (29Mar21)
 """
 import sys
 import os
+import multiprocessing
+
+
+if __name__ == "__main__":
+    # Let PyInstaller divert spawned multiprocessing children before importing
+    # Qt, SimpleITK, or any application controllers.
+    multiprocessing.freeze_support()
 
 # Fix for directory path issue in Docker
 current_file = os.path.abspath(__file__)
@@ -24,6 +31,7 @@ sys.path.insert(0, '../QSSFil/QSS_IMG')
 # Import functions self-written
 from Modules_JZ.FilterMask import FilterMaskMain
 from Modules_JZ.BatchNIIDataPrepare import BatchNIIDataPrepareMain
+from Modules_JZ.BatchPTDataPrepare import BatchPTDataPrepareMain
 from Modules_YC.Centerline_Extraction import Centerline_ExtractionMain
 from Modules_JZ.CenterlineXsection import CenterlineXsectionMain
 from Modules_AZ.TissueElemAssign import TissueElemAssignMain
@@ -81,7 +89,6 @@ from Modules_SH.BatchSliceRadiomics import BatchSliceRadiomicsMain
 # Standard libs
 import re
 import sys
-import multiprocessing
 from PySide2.QtWidgets import QApplication, QMessageBox
 from PySide2.QtUiTools import QUiLoader
 ##############################################################################
@@ -199,6 +206,12 @@ class GUIMain:
         self.ui.QStackedWidget_Module.addWidget(self.BatchNIIDataPrepareui.centralwidget)
         self.BatchNIIDataPrepare = BatchNIIDataPrepareMain.BatchNIIDataPrepare(
             UI=self.BatchNIIDataPrepareui, Hedys=self)
+
+        BatchPTDataPrepareuiPath = re.sub('main.ui', 'BatchPTDataPrepare.ui', uiPath)
+        self.BatchPTDataPrepareui = QUiLoader().load(BatchPTDataPrepareuiPath)
+        self.ui.QStackedWidget_Module.addWidget(self.BatchPTDataPrepareui.centralwidget)
+        self.BatchPTDataPrepare = BatchPTDataPrepareMain.BatchPTDataPrepare(
+            UI=self.BatchPTDataPrepareui, Hedys=self)
 
         BatchCoronaryFSIuiPath = re.sub('main.ui', 'BatchCoronaryFSI.ui', uiPath)
         self.BatchCoronaryFSIui = QUiLoader().load(BatchCoronaryFSIuiPath)
@@ -423,7 +436,6 @@ class GUIMain:
 
 # Create main
 if __name__ == "__main__":
-    multiprocessing.freeze_support()
     # if IDE has already created a QApplication
     app = QApplication.instance()
     if app is None:

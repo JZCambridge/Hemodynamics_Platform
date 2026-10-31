@@ -18,6 +18,7 @@ dependencies:
   - wheel=0.38.4=py37haa95532_0
   - wincertstore=0.2=py37haa95532_2
   - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cpu
       - altgraph==0.17.5
       - charset-normalizer==3.5.2
       - cycler==0.11.0
@@ -72,6 +73,7 @@ dependencies:
       - six==1.17.0
       - threadpoolctl==3.1.0
       - tifffile==2021.11.2
+      - torch==1.13.1+cpu
       - typing-extensions==4.7.1
       - tzdata==2026.5
       - urllib3==2.0.7

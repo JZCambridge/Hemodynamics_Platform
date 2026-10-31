@@ -2,6 +2,7 @@ import csv
 import errno
 import json
 import multiprocessing
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -307,6 +308,18 @@ def make_controller(
     controller.StoreListInformation()
     controller._prepare_lumen_process()
     return controller, case_paths, runner, correction_runner
+
+
+def set_case_artery_use(case_path, enabled_arteries):
+    json_path = (
+        Path(case_path) / "Preproc" / "CSV" /
+        "coronarySegmentsUse_BSRJZ.json"
+    )
+    branches = json.loads(json_path.read_text(encoding="utf-8"))
+    enabled = set(enabled_arteries)
+    for branch in branches:
+        branch["use"] = branch.get("branch_name") in enabled
+    json_path.write_text(json.dumps(branches), encoding="utf-8")
 
 
 class ResumePolicyTests(unittest.TestCase):
@@ -919,6 +932,598 @@ class XsectionRecordTests(unittest.TestCase):
                 100,
             )
             self.assertTrue(all(row["run_xsection"] == "1" for row in rows))
+
+
+class HybridParallelBatchTests(unittest.TestCase):
+    def test_zero_byte_dicom_marker_is_not_treated_as_dicom_input(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            case_path = Path(temporary_directory) / "CASE_DICOM"
+            case_path.mkdir()
+            marker_path = case_path / "discovery.dcm"
+            marker_path.write_bytes(b"")
+            self.assertFalse(
+                BatchSliceRadiomicsMain._contains_dicom(case_path)
+            )
+            marker_path.write_bytes(b"non-empty test DICOM placeholder")
+            self.assertTrue(
+                BatchSliceRadiomicsMain._contains_dicom(case_path)
+            )
+
+    """Pure synthetic coverage for hybrid discovery and coordination."""
+
+    @staticmethod
+    def _make_prepared_case(parent_path, case_id):
+        case_path = Path(parent_path) / case_id
+        input_path = case_path / "Preproc" / "OriData" / "CTA.nii.gz"
+        input_path.parent.mkdir(parents=True, exist_ok=True)
+        input_path.write_bytes(b"synthetic prepared CTA")
+        return case_path
+
+    @staticmethod
+    def _write_manifest(manifest_path, rows):
+        manifest_path = Path(manifest_path)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        field_names = [
+            "case_id",
+            "batch_name",
+            "case_relative_path",
+            "upstream_note",
+        ]
+        with manifest_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=field_names)
+            writer.writeheader()
+            writer.writerows(rows)
+        return manifest_path
+
+    def test_nested_discovery_preserves_exact_identity_and_sorts_largest_first(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root_path = Path(temporary_directory) / "0_Initial_Segmentation"
+            large_path = root_path / "batch_10"
+            small_path = root_path / "batch_2"
+            empty_path = root_path / "batch_empty"
+            for case_id in ("CASE_C", "CASE_A", "CASE_B"):
+                self._make_prepared_case(large_path, case_id)
+            self._make_prepared_case(small_path, "CASE_A")
+            (empty_path / "not_a_case").mkdir(parents=True)
+            (root_path / "notes").mkdir(parents=True)
+
+            manifest_path = self._write_manifest(
+                root_path / "BatchNIIDataPrepare_manifest.csv",
+                [
+                    {
+                        "case_id": "CASE_A",
+                        "batch_name": "batch_10",
+                        "case_relative_path": "batch_10/CASE_A",
+                        "upstream_note": "in scope",
+                    },
+                    {
+                        "case_id": "MOVED_CASE",
+                        "batch_name": "batch_10",
+                        "case_relative_path": "batch_10/MOVED_CASE",
+                        "upstream_note": "manifest only",
+                    },
+                    {
+                        "case_id": "UNRELATED",
+                        "batch_name": "legacy_batch",
+                        "case_relative_path": "legacy_batch/UNRELATED",
+                        "upstream_note": "out of scope",
+                    },
+                ],
+            )
+
+            discovery = BatchSliceRadiomicsMain.discover_batch_slice_work(
+                root_path,
+                manifest_path=manifest_path,
+                scan_dicom=False,
+            )
+
+            self.assertEqual(discovery.layout, "nested_batches")
+            self.assertEqual(discovery.discovered_count, 4)
+            self.assertEqual(discovery.manifest_only_count, 1)
+            self.assertEqual(discovery.out_of_scope_count, 1)
+            self.assertEqual(discovery.excluded_count, 2)
+            self.assertEqual(
+                [unit.batch_name for unit in discovery.work_units],
+                ["batch_10", "batch_2"],
+            )
+            self.assertEqual(
+                [unit.case_count for unit in discovery.work_units],
+                [3, 1],
+            )
+            self.assertEqual(
+                discovery.work_units[0].case_ids,
+                ("CASE_A", "CASE_B", "CASE_C"),
+            )
+            self.assertEqual(
+                discovery.work_units[1].case_ids,
+                ("CASE_A",),
+            )
+            self.assertNotEqual(
+                discovery.work_units[0].unit_id,
+                discovery.work_units[1].unit_id,
+            )
+
+    def test_flat_and_single_batch_roots_schedule_independent_case_units(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root_path = Path(temporary_directory) / "batch_7"
+            self._make_prepared_case(root_path, "CASE_002")
+            self._make_prepared_case(root_path, "CASE_001")
+            (root_path / "not_a_case").mkdir(parents=True)
+            (root_path / "Table").mkdir(parents=True)
+
+            discovery = BatchSliceRadiomicsMain.discover_batch_slice_work(
+                root_path,
+                scan_dicom=False,
+            )
+
+            self.assertEqual(discovery.layout, "direct_cases")
+            self.assertEqual(discovery.discovered_count, 2)
+            self.assertEqual(discovery.excluded_count, 1)
+            self.assertEqual(
+                [unit.case_ids for unit in discovery.work_units],
+                [("CASE_001",), ("CASE_002",)],
+            )
+            self.assertTrue(all(
+                unit.batch_name == "batch_7"
+                for unit in discovery.work_units
+            ))
+            self.assertEqual(len({
+                unit.record_path for unit in discovery.work_units
+            }), 2)
+            self.assertEqual(len({
+                unit.table_dir for unit in discovery.work_units
+            }), 2)
+            self.assertTrue(all(
+                Path(unit.table_dir).parent
+                == root_path / "Table" / "case_workers"
+                for unit in discovery.work_units
+            ))
+            self.assertTrue(all(
+                Path(unit.record_path).parent
+                == root_path / "Table" / "xsection_record" / "pending"
+                for unit in discovery.work_units
+            ))
+            self.assertEqual(len({
+                unit.canonical_record_path for unit in discovery.work_units
+            }), 1)
+            self.assertTrue(all(
+                Path(unit.canonical_record_path)
+                == root_path / "Table" / "xsection_record" /
+                "batch_xsection.csv"
+                for unit in discovery.work_units
+            ))
+
+    def test_parallel_worker_limit_respects_request_units_and_logical_cpus(self):
+        clamp = BatchSliceRadiomicsMain.clamp_parallel_workers
+
+        self.assertEqual(clamp(32, 100, logical_cpus=24), 24)
+        self.assertEqual(clamp(24, 7, logical_cpus=64), 7)
+        self.assertEqual(clamp(0, 7, logical_cpus=64), 1)
+        self.assertEqual(clamp("invalid", 100, logical_cpus=64), 4)
+        self.assertEqual(clamp(32, 0, logical_cpus=64), 0)
+
+    def test_direct_case_stages_only_its_rows_from_shared_tables(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root_path = Path(temporary_directory) / "flat_root"
+            case_paths = {
+                case_id: self._make_prepared_case(root_path, case_id)
+                for case_id in ("CASE_001", "CASE_002")
+            }
+            shared_table_path = root_path / "Table"
+            table_writer = BatchSliceRadiomicsMain.BatchSliceRadiomics._write_table
+
+            filter_rows = []
+            xsection_rows = []
+            fix_rows = []
+            for case_id, case_path in case_paths.items():
+                preproc_path = case_path / "Preproc"
+                ori_data_path = preproc_path / "OriData"
+                csv_path = preproc_path / "CSV"
+                xsection_path = preproc_path / "Xsection"
+                fix_path = preproc_path / "XsectionFix"
+                filter_rows.append({
+                    "MaskPath": str(
+                        ori_data_path / "sc_labelled_coronary_segment.nii.gz"
+                    ),
+                    "MaskVal": "13",
+                    "NewMaskVal": "1",
+                    "OutputFolder": str(ori_data_path / "Branches"),
+                    "FileNameRef": "LCx_OriB_",
+                })
+                xsection_rows.append({
+                    "inputDir": str(ori_data_path),
+                    "inputCSVDir": str(csv_path),
+                    "outputDir": str(xsection_path),
+                    "outputCSVDir": str(csv_path),
+                    "resampleDepth": "0.1",
+                    "CPRAngle": "0",
+                    "cpus": "91",
+                    "casePath": str(
+                        shared_table_path / (case_id + "_Xsection.csv")
+                    ),
+                    "EXEPath": "stale.exe",
+                })
+                fix_rows.append({
+                    "Image Path": str(xsection_path / "LCxCTALI.nii.gz"),
+                    "Mask Path": str(xsection_path / "LCxValNN.nii.gz"),
+                    "Process Path": str(shared_table_path / "LCProcess.csv"),
+                    "Fill Original Value": "No",
+                    "Output Directory": str(fix_path),
+                    "Output Name": "LCxValNNFix",
+                })
+
+            table_writer(
+                shared_table_path / "FilterMask_BSRJZ.csv",
+                BatchSliceRadiomicsMain.BatchSliceRadiomics.FILTER_MASK_HEADERS,
+                filter_rows,
+            )
+            table_writer(
+                shared_table_path / "Xsection_BSRJZ.csv",
+                BatchSliceRadiomicsMain.BatchSliceRadiomics.XSECTION_HEADERS,
+                xsection_rows,
+            )
+            table_writer(
+                shared_table_path / "XsectionFix_BSRJZ.csv",
+                BatchSliceRadiomicsMain.BatchSliceRadiomics.XSECTION_FIX_HEADERS,
+                fix_rows,
+            )
+            config = BatchSliceRadiomicsMain.BatchSliceRunConfig(
+                root_path=str(root_path),
+                manifest_path=str(
+                    root_path / "BatchNIIDataPrepare_manifest.csv"
+                ),
+                failed_root_path=str(Path(temporary_directory) / "failed"),
+                cpr_exe_path="current.exe",
+                lumen_process_path="LCProcess.csv",
+                generate_tables=False,
+                selected_arteries=("LCx",),
+            )
+            discovery = BatchSliceRadiomicsMain.discover_batch_slice_work(config)
+            case_unit = next(
+                unit for unit in discovery.work_units
+                if unit.case_ids == ("CASE_001",)
+            )
+            controller = BatchSliceRadiomicsMain.BatchSliceRadiomics()
+
+            controller._apply_run_config(config, case_unit)
+
+            staged_tables = (
+                (
+                    Path(controller.FilterMaskTablePath),
+                    controller.FILTER_MASK_HEADERS,
+                ),
+                (
+                    Path(controller.XsectionTablePath),
+                    controller.XSECTION_HEADERS,
+                ),
+                (
+                    Path(controller.XsectionFixTablePath),
+                    controller.XSECTION_FIX_HEADERS,
+                ),
+            )
+            self.assertTrue(all(
+                table_path.parent == Path(case_unit.table_dir)
+                for table_path, _ in staged_tables
+            ))
+            for table_path, expected_headers in staged_tables:
+                self.assertEqual(read_csv_header(table_path), list(expected_headers))
+                rows = read_csv(table_path)
+                self.assertEqual(len(rows), 1)
+                staged_text = " ".join(rows[0].values())
+                self.assertIn("CASE_001", staged_text)
+                self.assertNotIn("CASE_002", staged_text)
+
+    def test_runtime_executable_and_inner_worker_override_stale_table_values(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, _, _, _ = make_controller(
+                temporary_directory,
+                selected_arteries=("LCx",),
+            )
+            controller.MaskXsectionFlag = True
+            controller.GenerateTable(
+                cpus="97",
+                maskXsection=True,
+                maskXsectionOnly=False,
+            )
+            table_path = Path(controller.XsectionTablePath)
+            field_names = read_csv_header(table_path)
+            rows = read_csv(table_path)
+            for row in rows:
+                row["EXEPath"] = str(
+                    Path(temporary_directory) / "stale CPR.exe"
+                )
+                row["cpus"] = "97"
+            with table_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=field_names)
+                writer.writeheader()
+                writer.writerows(rows)
+
+            runtime_executable = (
+                Path(temporary_directory) / "current CPR.exe"
+            )
+            runtime_executable.write_bytes(b"current executable")
+            controller.CPREXEPath = str(runtime_executable)
+            controller.InnerXsectionWorkers = 1
+
+            jobs = controller._load_xsection_jobs()
+
+            self.assertEqual(len(jobs), 2)
+            self.assertTrue(all(
+                job["arguments"][0] == str(runtime_executable)
+                for job in jobs.values()
+            ))
+            self.assertTrue(all(
+                job["workers"] == 1 for job in jobs.values()
+            ))
+            self.assertFalse(any(
+                "stale CPR.exe" in argument
+                for job in jobs.values()
+                for argument in job["arguments"]
+            ))
+
+    def test_synchronous_headless_worker_starts_with_all_stages_disabled(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root_path = Path(temporary_directory) / "flat_root"
+            self._make_prepared_case(root_path, "CASE_001")
+            manifest_path = root_path / "BatchNIIDataPrepare_manifest.csv"
+            config = BatchSliceRadiomicsMain.BatchSliceRunConfig(
+                root_path=str(root_path),
+                manifest_path=str(manifest_path),
+                failed_root_path=str(Path(temporary_directory) / "failed"),
+                cpr_exe_path=str(Path(temporary_directory) / "unused.exe"),
+                lumen_process_path=str(
+                    Path(temporary_directory) / "unused.csv"
+                ),
+                max_workers=1,
+                create_folders=False,
+                branch_dictionary=False,
+                generate_tables=False,
+                filter_mask=False,
+                xsection=False,
+                lumen_correction=False,
+                selected_arteries=("LCx",),
+            )
+            discovery = BatchSliceRadiomicsMain.discover_batch_slice_work(
+                config
+            )
+            work_unit = discovery.work_units[0]
+            prior_itk_threads = (
+                sitk.ProcessObject.GetGlobalDefaultNumberOfThreads()
+            )
+            prior_environment = {
+                name: os.environ.get(name)
+                for name in BatchSliceRadiomicsMain._WORKER_THREAD_ENVIRONMENT
+            }
+            try:
+                result = BatchSliceRadiomicsMain.run_batch_slice_work_unit(
+                    config,
+                    work_unit,
+                )
+            finally:
+                sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(
+                    prior_itk_threads
+                )
+                for name, prior_value in prior_environment.items():
+                    if prior_value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = prior_value
+
+            self.assertEqual(result.error_message, "")
+            self.assertEqual(result.output_tail, "")
+            self.assertEqual(result.case_count, 1)
+            self.assertTrue(Path(result.record_path).is_file())
+            records = read_csv(result.record_path)
+            self.assertEqual(
+                [(row["batch_name"], row["case_id"]) for row in records],
+                [("flat_root", "CASE_001")],
+            )
+
+    def test_pending_compaction_preserves_manifest_only_rows_and_columns(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root_path = Path(temporary_directory)
+            canonical_path = (
+                root_path / "Table" / "xsection_record" /
+                "batch_xsection.csv"
+            )
+            pending_path = canonical_path.parent / "pending" / "case_b.csv"
+            manifest_path = self._write_manifest(
+                root_path / "BatchNIIDataPrepare_manifest.csv",
+                [
+                    {
+                        "case_id": "CASE_A",
+                        "batch_name": "flat_root",
+                        "case_relative_path": "flat_root/CASE_A",
+                        "upstream_note": "keep A metadata",
+                    },
+                    {
+                        "case_id": "UNRELATED",
+                        "batch_name": "legacy_batch",
+                        "case_relative_path": "legacy_batch/UNRELATED",
+                        "upstream_note": "must survive",
+                    },
+                ],
+            )
+            BatchSliceRadiomicsMain.write_xsection_records(
+                canonical_path,
+                [xsection_record(
+                    "CASE_A",
+                    "flat_root",
+                    complete_xsection_CTA=1,
+                )],
+            )
+            BatchSliceRadiomicsMain.write_xsection_records(
+                pending_path,
+                [xsection_record(
+                    "CASE_B",
+                    "flat_root",
+                    complete_xsection_seg=1,
+                )],
+            )
+
+            result = BatchSliceRadiomicsMain.compact_pending_ledgers(
+                canonical_path,
+                manifest_path=manifest_path,
+            )
+
+            self.assertEqual(result["pending_file_count"], 1)
+            self.assertEqual(result["errors"], ())
+            self.assertFalse(pending_path.exists())
+            canonical_rows = read_csv(canonical_path)
+            self.assertEqual(
+                [(row["batch_name"], row["case_id"]) for row in canonical_rows],
+                [("flat_root", "CASE_A"), ("flat_root", "CASE_B")],
+            )
+            manifest_rows = read_csv(manifest_path)
+            by_identity = {
+                (row["batch_name"], row["case_id"]): row
+                for row in manifest_rows
+            }
+            self.assertEqual(len(manifest_rows), 3)
+            self.assertEqual(
+                by_identity[("legacy_batch", "UNRELATED")]["upstream_note"],
+                "must survive",
+            )
+            self.assertEqual(
+                by_identity[("flat_root", "CASE_A")]["upstream_note"],
+                "keep A metadata",
+            )
+            self.assertEqual(
+                by_identity[("flat_root", "CASE_B")]["complete_xsection_seg"],
+                "1",
+            )
+
+    def test_progress_is_monotonic_deduplicated_and_counts_terminal_cases(self):
+        units = (
+            BatchSliceRadiomicsMain.BatchSliceWorkUnit(
+                unit_id="batch:batch_0",
+                layout="nested_batches",
+                working_dir="batch_0",
+                batch_name="batch_0",
+                case_paths=("batch_0/CASE_A", "batch_0/CASE_B"),
+                table_dir="batch_0/Table",
+                record_path="batch_0/Table/record.csv",
+                canonical_record_path="batch_0/Table/record.csv",
+            ),
+        )
+        discovery = BatchSliceRadiomicsMain.BatchSliceDiscovery(
+            layout="nested_batches",
+            work_units=units,
+            discovered_count=2,
+            excluded_count=0,
+            manifest_only_count=0,
+            out_of_scope_count=0,
+            scope_batch_names=("batch_0",),
+        )
+        stages = ("Filter Mask", "Xsection", "Lumen Correction")
+        tracker = BatchSliceRadiomicsMain.BatchSliceProgressTracker(
+            discovery,
+            stages,
+            started_at=time.monotonic() - 1.0,
+        )
+        percentages = [tracker.snapshot().percent]
+        tracker.consume(BatchSliceRadiomicsMain.BatchSliceProgress(
+            kind="unit_started",
+            unit_id="batch:batch_0",
+        ))
+        for case_id, state in (("CASE_A", "completed"), ("CASE_B", "skipped")):
+            for stage in stages:
+                snapshot = tracker.consume(
+                    BatchSliceRadiomicsMain.BatchSliceProgress(
+                        kind="case_stage",
+                        batch_name="batch_0",
+                        case_id=case_id,
+                        stage=stage,
+                        state=state,
+                    )
+                )
+                percentages.append(snapshot.percent)
+        duplicate = tracker.consume(BatchSliceRadiomicsMain.BatchSliceProgress(
+            kind="case_stage",
+            batch_name="batch_0",
+            case_id="CASE_A",
+            stage="Xsection",
+            state="failed",
+        ))
+        tracker.consume(BatchSliceRadiomicsMain.BatchSliceProgress(
+            kind="unit_finished",
+            unit_id="batch:batch_0",
+        ))
+        final_snapshot = BatchSliceRadiomicsMain.summarize_progress(tracker)
+
+        self.assertEqual(percentages, sorted(percentages))
+        self.assertEqual(duplicate.done_steps, 6)
+        self.assertEqual(final_snapshot.percent, 100)
+        self.assertEqual(final_snapshot.completed_cases, 1)
+        self.assertEqual(final_snapshot.skipped_cases, 1)
+        self.assertEqual(final_snapshot.failed_cases, 0)
+        self.assertEqual(final_snapshot.active_workers, 0)
+        self.assertGreaterEqual(final_snapshot.elapsed_seconds, 1.0)
+        self.assertEqual(final_snapshot.eta_seconds, 0.0)
+
+    def test_enabled_stage_order_is_serial_and_stable(self):
+        config = BatchSliceRadiomicsMain.BatchSliceRunConfig(
+            root_path="root",
+            manifest_path="manifest.csv",
+            failed_root_path="failed",
+            cpr_exe_path="cpr.exe",
+            lumen_process_path="LCProcess.csv",
+        )
+
+        self.assertEqual(
+            config.enabled_stages,
+            ("Filter Mask", "Xsection", "Lumen Correction"),
+        )
+
+    def test_legacy_lumen_path_is_restored_and_fallback_exists(self):
+        ui_path = GUI_ROOT / "ui" / "BatchSliceRadiomics.ui"
+        root = ElementTree.parse(str(ui_path)).getroot()
+        widget = root.find(
+            ".//widget[@name='LumenCorrectionPath_Txt_BSRJZ']"
+        )
+        self.assertIsNotNone(widget)
+        html_element = widget.find("./property[@name='html']/string")
+        self.assertIsNotNone(html_element)
+        html_text = html_element.text or ""
+        paragraph_content = html_text.rsplit("<p ", 1)[1]
+        paragraph_content = paragraph_content.split(">", 1)[1]
+        paragraph_content = paragraph_content.split("</p>", 1)[0]
+        self.assertEqual(
+            paragraph_content.strip(),
+            "D:/Software/HymoV01_270424/Base/Tables/LC/LCProcess.csv",
+        )
+
+        default_path = Path(
+            BatchSliceRadiomicsMain.BatchSliceRadiomics
+            ._default_lumen_process_path()
+        )
+        self.assertTrue(default_path.is_file())
+        self.assertEqual(default_path.name, "LCProcess.csv")
+        self.assertEqual(default_path.parent.name, "LC")
+
+        expected_checkbox_defaults = {
+            "ScanFile_CB_BSRJZ": "false",
+            "CreateFolders_CB_BSRJZ": "true",
+            "BranchDict_CB_BSRJZ": "false",
+            "GenerateTable_CB_BSRJZ": "true",
+            "FM_CB_BSRJZ": "false",
+            "Xsection_CB_BSRJZ": "true",
+            "LumenCorrection_CB_BSRJZ": "true",
+            "maskXsection_CB_BSRJZ": "true",
+            "maskXsectionOnly_CB_BSRJZ": "false",
+        }
+        for widget_name, expected_value in expected_checkbox_defaults.items():
+            checkbox = root.find(
+                ".//widget[@name='{0}']".format(widget_name)
+            )
+            self.assertIsNotNone(checkbox, widget_name)
+            checked = checkbox.find("./property[@name='checked']/bool")
+            self.assertIsNotNone(checked, widget_name)
+            self.assertEqual(
+                (checked.text or "").strip().lower(),
+                expected_value,
+                widget_name,
+            )
 
 
 class BatchSliceRadiomicsControllerTests(unittest.TestCase):
@@ -2168,6 +2773,315 @@ class BatchSliceRadiomicsControllerTests(unittest.TestCase):
             ]
             self.assertEqual(len(retry_runner.calls), 1)
             self.assertTrue(retried["complete"])
+
+
+class PerCaseArteryApplicabilityTests(unittest.TestCase):
+    def test_all_selected_arteries_use_false_are_not_applicable(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            filter_runner = RecordingFilterMaskRunner()
+            controller, case_paths, xsection_runner, lumen_runner = make_controller(
+                temporary_directory,
+                filter_mask_runner=filter_runner,
+            )
+            case_path = case_paths[0]
+            set_case_artery_use(case_path, ())
+            events = []
+            controller._progress_callback = events.append
+            controller.GenerateTable(maskXsection=True, maskXsectionOnly=False)
+
+            self.assertEqual(
+                read_csv(case_path / "Preproc" / "CSV" / "case_BSRJZ.csv"),
+                [],
+            )
+            self.assertEqual(read_csv(controller.FilterMaskTablePath), [])
+            self.assertEqual(read_csv(controller.XsectionFixTablePath), [])
+            self.assertEqual(len(read_csv(controller.XsectionTablePath)), 1)
+
+            filter_outcome = controller.BatchFilterMask()[str(case_path)]
+            xsection_outcomes = controller.BatchXsection()
+            lumen_outcomes = controller.BatchLumenCorrection()
+
+            self.assertTrue(filter_outcome["complete"])
+            self.assertTrue(filter_outcome["skipped"])
+            self.assertEqual(filter_runner.calls, [])
+            self.assertEqual(xsection_runner.calls, [])
+            self.assertEqual(lumen_runner.calls, [])
+            self.assertTrue(all(
+                outcome.get("not_applicable")
+                for outcome in xsection_outcomes.values()
+            ))
+            self.assertTrue(all(
+                outcome.get("not_applicable")
+                for outcome in lumen_outcomes.values()
+            ))
+
+            saved = read_csv(controller.XsectionRecordPath)[0]
+            self.assertEqual(saved["filter_mask_complete"], "1")
+            self.assertEqual(saved["complete_xsection_CTA"], "1")
+            self.assertEqual(saved["complete_xsection_seg"], "1")
+            self.assertEqual(saved["complete_lumen_correction"], "1")
+            for artery in ("LCx", "mLAD", "mRCA"):
+                self.assertEqual(saved[artery + "_filter_mask_complete"], "0")
+                self.assertEqual(saved[artery + "_xsection_CTA_complete"], "0")
+                self.assertEqual(saved[artery + "_xsection_seg_complete"], "0")
+                self.assertEqual(saved[artery + "_lumen_complete"], "0")
+                self.assertEqual(saved[artery + "_xsection_CTA_exe_er_msg"], "")
+                self.assertEqual(saved[artery + "_xsection_seg_exe_er_msg"], "")
+                self.assertEqual(saved[artery + "_lumen_er_msg"], "")
+
+            stage_events = [event for event in events if event.kind == "case_stage"]
+            self.assertEqual(
+                [(event.stage, event.state) for event in stage_events],
+                [
+                    ("Filter Mask", "skipped"),
+                    ("Xsection", "skipped"),
+                    ("Lumen Correction", "skipped"),
+                ],
+            )
+
+    def test_mixed_applicability_runs_only_use_true_arteries(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            filter_runner = RecordingFilterMaskRunner()
+            controller, case_paths, xsection_runner, lumen_runner = make_controller(
+                temporary_directory,
+                filter_mask_runner=filter_runner,
+            )
+            case_path = case_paths[0]
+            set_case_artery_use(case_path, ("LCx",))
+            controller.GenerateTable(maskXsection=True, maskXsectionOnly=False)
+
+            controller.BatchFilterMask()
+            controller.BatchXsection()
+            controller.BatchLumenCorrection()
+
+            self.assertEqual(len(filter_runner.calls), 1)
+            self.assertEqual(
+                filter_runner.calls[0]["file_names"], ["LCx_OriB_"]
+            )
+            self.assertEqual(
+                {call["output_name"] for call in xsection_runner.calls},
+                {"LCxCTALI.nii.gz", "LCxValNN.nii.gz"},
+            )
+            self.assertEqual(len(lumen_runner.calls), 1)
+            self.assertEqual(
+                lumen_runner.calls[0]["output_name"],
+                "LCxValNNFixVal.nii.gz",
+            )
+
+            saved = read_csv(controller.XsectionRecordPath)[0]
+            self.assertEqual(saved["complete_xsection_CTA"], "1")
+            self.assertEqual(saved["complete_xsection_seg"], "1")
+            self.assertEqual(saved["complete_lumen_correction"], "1")
+            for artery in ("mLAD", "mRCA"):
+                self.assertEqual(saved[artery + "_xsection_CTA_complete"], "0")
+                self.assertEqual(saved[artery + "_xsection_seg_complete"], "0")
+                self.assertEqual(saved[artery + "_lumen_complete"], "0")
+                self.assertEqual(saved[artery + "_xsection_CTA_exe_er_msg"], "")
+                self.assertEqual(saved[artery + "_xsection_seg_exe_er_msg"], "")
+                self.assertEqual(saved[artery + "_lumen_er_msg"], "")
+
+    def test_missing_row_for_use_true_remains_a_failure(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths, xsection_runner, _ = make_controller(
+                temporary_directory,
+            )
+            case_path = case_paths[0]
+            set_case_artery_use(case_path, ("LCx",))
+            controller.GenerateTable(maskXsection=True, maskXsectionOnly=False)
+            case_table_path = case_path / "Preproc" / "CSV" / "case_BSRJZ.csv"
+            case_rows = [
+                row for row in read_csv(case_table_path)
+                if row["outputImagePath"] != "LCxValNN.nii.gz"
+            ]
+            controller._write_table(
+                case_table_path, controller.CASE_HEADERS, case_rows
+            )
+
+            outcomes = controller.BatchXsection()
+
+            missing = outcomes[("CASE_001", "LCx", "seg")]
+            self.assertFalse(missing["complete"])
+            self.assertFalse(missing["skipped"])
+            self.assertIn("No seg Xsection table row for LCx", missing["error_message"])
+            self.assertEqual(
+                [call["output_name"] for call in xsection_runner.calls],
+                ["LCxCTALI.nii.gz"],
+            )
+            saved = read_csv(controller.XsectionRecordPath)[0]
+            self.assertEqual(saved["LCx_xsection_seg_complete"], "0")
+            self.assertEqual(saved["complete_xsection_seg"], "0")
+            self.assertEqual(saved["mLAD_xsection_seg_exe_er_msg"], "")
+            self.assertEqual(saved["mRCA_xsection_seg_exe_er_msg"], "")
+
+
+class ApplicabilityResumeAndSafetyTests(unittest.TestCase):
+    def test_stale_false_failures_are_repaired_with_rerun_failed_off(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            filter_runner = RecordingFilterMaskRunner()
+            controller, case_paths, xsection_runner, lumen_runner = make_controller(
+                temporary_directory,
+                filter_mask_runner=filter_runner,
+            )
+            case_path = case_paths[0]
+            set_case_artery_use(case_path, ())
+            controller.GenerateTable(maskXsection=True, maskXsectionOnly=False)
+            record_map = controller._load_xsection_record_map()
+            record = controller._ensure_case_record(record_map, case_path)
+            for artery in ("LCx", "mLAD", "mRCA"):
+                record[artery + "_filter_mask_complete"] = 0
+                record[artery + "_filter_mask_er_msg"] = (
+                    "No Filter Mask row for " + artery
+                )
+                record[artery + "_filter_mask_fingerprint"] = "old-filter"
+                for artifact_type in ("CTA", "seg"):
+                    prefix = artery + "_xsection_" + artifact_type
+                    record[prefix + "_exe_failed"] = 0
+                    record[prefix + "_complete"] = 0
+                    record[prefix + "_exe_er_msg"] = (
+                        "No " + artifact_type + " Xsection table row for " + artery
+                    )
+                    record[prefix + "_fingerprint"] = "old-xsection"
+                record[artery + "_lumen_complete"] = 0
+                record[artery + "_lumen_er_msg"] = (
+                    "No Lumen Correction table row for " + artery
+                )
+                record[artery + "_lumen_fingerprint"] = "old-lumen"
+            controller._save_xsection_record_map(record_map)
+            controller.RerunFailedFlag = False
+
+            filter_outcome = controller.BatchFilterMask()[str(case_path)]
+            xsection_outcomes = controller.BatchXsection()
+            lumen_outcomes = controller.BatchLumenCorrection()
+
+            self.assertTrue(filter_outcome["complete"])
+            self.assertFalse(filter_outcome["failed_skipped"])
+            self.assertEqual(filter_runner.calls, [])
+            self.assertEqual(xsection_runner.calls, [])
+            self.assertEqual(lumen_runner.calls, [])
+            self.assertFalse(any(
+                outcome.get("failed_skipped")
+                for outcome in xsection_outcomes.values()
+            ))
+            self.assertFalse(any(
+                outcome.get("failed_skipped")
+                for outcome in lumen_outcomes.values()
+            ))
+            saved = read_csv(controller.XsectionRecordPath)[0]
+            for artery in ("LCx", "mLAD", "mRCA"):
+                self.assertEqual(saved[artery + "_filter_mask_er_msg"], "")
+                self.assertEqual(saved[artery + "_xsection_CTA_exe_er_msg"], "")
+                self.assertEqual(saved[artery + "_xsection_seg_exe_er_msg"], "")
+                self.assertEqual(saved[artery + "_lumen_er_msg"], "")
+            self.assertEqual(saved["complete_xsection_CTA"], "1")
+            self.assertEqual(saved["complete_xsection_seg"], "1")
+            self.assertEqual(saved["complete_lumen_correction"], "1")
+
+    def test_unreliable_applicability_remains_strict(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths, xsection_runner, _ = make_controller(
+                temporary_directory,
+                selected_arteries=("LCx",),
+            )
+            case_path = case_paths[0]
+            use_json_path = (
+                case_path / "Preproc" / "CSV" /
+                "coronarySegmentsUse_BSRJZ.json"
+            )
+            use_json_path.write_text("{invalid json", encoding="utf-8")
+
+            self.assertEqual(
+                controller.GenerateTable(
+                    maskXsection=True, maskXsectionOnly=False
+                ),
+                [],
+            )
+            outcomes = controller.BatchXsection()
+
+            self.assertEqual(xsection_runner.calls, [])
+            for artifact_type in ("CTA", "seg"):
+                outcome = outcomes[("CASE_001", "LCx", artifact_type)]
+                self.assertFalse(outcome["complete"])
+                self.assertIn(
+                    "Cannot verify per-case artery applicability",
+                    outcome["error_message"],
+                )
+            saved = read_csv(controller.XsectionRecordPath)[0]
+            self.assertEqual(saved["complete_xsection_CTA"], "0")
+            self.assertEqual(saved["complete_xsection_seg"], "0")
+
+    def test_generate_table_off_reconstructs_only_with_durable_marker(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths, _, _ = make_controller(temporary_directory)
+            case_path = case_paths[0]
+            set_case_artery_use(case_path, ())
+            controller.GenerateTable(maskXsection=True, maskXsectionOnly=False)
+            controller._case_applicability = {}
+
+            verified = controller._case_artery_applicability(case_path)
+
+            self.assertTrue(verified.reliable)
+            self.assertEqual(verified.applicable_arteries, ())
+            controller._write_table(
+                controller.XsectionTablePath, controller.XSECTION_HEADERS, []
+            )
+            controller._case_applicability = {}
+
+            unverified = controller._case_artery_applicability(case_path)
+
+            self.assertFalse(unverified.reliable)
+            self.assertEqual(
+                unverified.applicable_arteries, tuple(controller.SelectedArteries)
+            )
+
+    def test_stale_case_filter_error_does_not_block_applicable_artery(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            controller, case_paths, xsection_runner, lumen_runner = make_controller(
+                temporary_directory,
+            )
+            case_path = case_paths[0]
+            set_case_artery_use(case_path, ("LCx",))
+            controller.GenerateTable(maskXsection=True, maskXsectionOnly=False)
+            record_map = controller._load_xsection_record_map()
+            record = controller._ensure_case_record(record_map, case_path)
+            record["filter_mask_complete"] = 0
+            record["filter_mask_er_msg"] = (
+                "mLAD: No Filter Mask row for mLAD; "
+                "mRCA: No Filter Mask row for mRCA"
+            )
+            record["filter_mask_fingerprint"] = "legacy-case-fingerprint"
+            controller._save_xsection_record_map(record_map)
+
+            xsection_outcomes = controller.BatchXsection()
+            lumen_outcomes = controller.BatchLumenCorrection()
+
+            self.assertTrue(
+                xsection_outcomes[("CASE_001", "LCx", "seg")]["complete"]
+            )
+            self.assertTrue(lumen_outcomes[("CASE_001", "LCx")]["complete"])
+            self.assertEqual(len(xsection_runner.calls), 2)
+            self.assertEqual(len(lumen_runner.calls), 1)
+
+    def test_worker_initializer_ignores_sigint_only_in_child_processes(self):
+        with mock.patch.object(
+                BatchSliceRadiomicsMain.multiprocessing,
+                "current_process",
+                return_value=SimpleNamespace(name="SpawnProcess-1")), mock.patch.object(
+                    BatchSliceRadiomicsMain.signal, "signal"
+                ) as signal_mock:
+            BatchSliceRadiomicsMain._initialize_batch_slice_worker()
+            signal_mock.assert_called_once_with(
+                BatchSliceRadiomicsMain.signal.SIGINT,
+                BatchSliceRadiomicsMain.signal.SIG_IGN,
+            )
+
+        with mock.patch.object(
+                BatchSliceRadiomicsMain.multiprocessing,
+                "current_process",
+                return_value=SimpleNamespace(name="MainProcess")), mock.patch.object(
+                    BatchSliceRadiomicsMain.signal, "signal"
+                ) as signal_mock:
+            BatchSliceRadiomicsMain._initialize_batch_slice_worker()
+            signal_mock.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ Some modules call external software or executables that are not installed by the
 
 ## Windows installation with Conda (recommended)
 
-The project is a legacy, CPU-only Python 3.7 application. Use the pinned versions below; do not replace Python 3.7 with a newer version unless the source code and dependencies are upgraded together. CUDA and deep-learning frameworks are not required.
+The project is a legacy, CPU-only Python 3.7 application. Use the pinned versions below; do not replace Python 3.7 with a newer version unless the source code and dependencies are upgraded together. CUDA is not required. The PT data-preparation workflow uses the official CPU-only `torch==1.13.1+cpu` build, which is the final PyTorch release supporting Python 3.7.
 
 ### 1. Install Conda
 
@@ -61,7 +61,7 @@ python --version
 Copy this command as one line:
 
 ```bat
-python -c "import PySide2, vtk, pyvista, pyvistaqt, SimpleITK, cv2, numpy, scipy, skimage, sklearn, pandas, meshio, yaml, radiomics, openpyxl, networkx; print('Environment check passed')"
+python -c "import PySide2, vtk, pyvista, pyvistaqt, SimpleITK, cv2, numpy, scipy, skimage, sklearn, pandas, meshio, yaml, radiomics, openpyxl, networkx, torch; assert torch.__version__ == '1.13.1+cpu' and torch.version.cuda is None; print('Environment check passed')"
 ```
 
 Continue only after it prints `Environment check passed` without an exception.
@@ -107,6 +107,7 @@ Install the packages into the active environment. Run every command and stop if 
 python -m pip install psutil==5.9.4
 python -m pip install PySide2==5.15.2.1 shiboken2==5.15.2.1
 python -m pip install numpy==1.21.6
+python -m pip install torch==1.13.1+cpu --extra-index-url https://download.pytorch.org/whl/cpu
 python -m pip install SimpleITK==2.0.2
 python -m pip install matplotlib==3.4.0
 python -m pip install opencv-python==4.5.4.60

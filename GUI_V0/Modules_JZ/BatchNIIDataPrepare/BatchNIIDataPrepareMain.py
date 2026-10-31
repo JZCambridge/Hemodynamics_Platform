@@ -545,10 +545,20 @@ def _copy_and_verify(source, destination, expected_size, expected_sha256):
             temporary_path.unlink()
 
 
-def _write_manifest_atomic(manifest_path, rows):
+def _write_manifest_atomic(manifest_path, rows, additional_fieldnames=()):
     """Publish a complete deterministic CSV without exposing a partial file."""
 
     manifest_path = Path(manifest_path)
+    extra_fieldnames = []
+    known_fieldnames = set(MANIFEST_FIELDS)
+    for fieldname in additional_fieldnames:
+        if (
+            fieldname
+            and fieldname not in known_fieldnames
+            and fieldname not in extra_fieldnames
+        ):
+            extra_fieldnames.append(fieldname)
+    fieldnames = MANIFEST_FIELDS + tuple(extra_fieldnames)
     file_descriptor, temporary_name = tempfile.mkstemp(
         prefix=".{0}.".format(manifest_path.name),
         suffix=".tmp",
@@ -560,7 +570,7 @@ def _write_manifest_atomic(manifest_path, rows):
         with os.fdopen(file_descriptor, "w", encoding="utf-8", newline="") as csv_file:
             writer = csv.DictWriter(
                 csv_file,
-                fieldnames=MANIFEST_FIELDS,
+                fieldnames=fieldnames,
                 extrasaction="raise",
                 lineterminator="\n",
             )
@@ -572,19 +582,25 @@ def _write_manifest_atomic(manifest_path, rows):
             temporary_path.unlink()
 
 
-def _read_segmentation_status(manifest_path):
-    """Return previously recorded processing fields keyed by batch and case."""
+def _read_manifest_state(manifest_path):
+    """Return reusable row state and unknown columns from an existing manifest."""
 
     manifest_path = Path(manifest_path)
     if not manifest_path.is_file():
-        return {}
+        return {}, ()
 
     statuses = {}
     with manifest_path.open("r", encoding="utf-8", newline="") as csv_file:
         reader = csv.DictReader(csv_file)
-        fieldnames = set(reader.fieldnames or ())
+        ordered_fieldnames = tuple(reader.fieldnames or ())
+        fieldnames = set(ordered_fieldnames)
         if not {"batch_name", "case_id"}.issubset(fieldnames):
-            return {}
+            return {}, ()
+        additional_fieldnames = tuple(
+            fieldname
+            for fieldname in ordered_fieldnames
+            if fieldname and fieldname not in MANIFEST_FIELDS
+        )
         for row in reader:
             key = (
                 row.get("batch_name", "").strip().casefold(),
@@ -597,9 +613,29 @@ def _read_segmentation_status(manifest_path):
                 for field in PROCESSING_STATUS_FIELDS
                 if field in fieldnames
             }
+            status.update(
+                {
+                    field: row.get(field, "")
+                    for field in additional_fieldnames
+                }
+            )
             status["_source_sha256"] = row.get("source_sha256", "")
             statuses[key] = status
-    return statuses
+    return statuses, additional_fieldnames
+
+
+def _read_segmentation_status(manifest_path):
+    """Return previously recorded processing fields keyed by batch and case."""
+
+    statuses, _ = _read_manifest_state(manifest_path)
+    return {
+        key: {
+            field: value
+            for field, value in status.items()
+            if field in PROCESSING_STATUS_FIELDS or field == "_source_sha256"
+        }
+        for key, status in statuses.items()
+    }
 
 
 def prepare_batch_data(
@@ -653,7 +689,9 @@ def prepare_batch_data(
     data_root = output_root / OUTPUT_FOLDER_NAME
     data_root.mkdir(parents=True, exist_ok=True)
     manifest_path = data_root / MANIFEST_FILE_NAME
-    previous_processing_status = _read_segmentation_status(manifest_path)
+    previous_manifest_state, additional_manifest_fields = _read_manifest_state(
+        manifest_path
+    )
 
     rows = []
     copied_file_count = 0
@@ -753,7 +791,7 @@ def prepare_batch_data(
             "all_verified": all_verified,
         }
         processing_status = dict(PROCESSING_STATUS_DEFAULTS)
-        previous_status = previous_processing_status.get(
+        previous_status = previous_manifest_state.get(
             (plan.batch_name.casefold(), plan.case_id.casefold()),
             {},
         )
@@ -765,6 +803,12 @@ def prepare_batch_data(
                     if field in previous_status
                 }
             )
+            row.update(
+                {
+                    field: previous_status.get(field, "")
+                    for field in additional_manifest_fields
+                }
+            )
         row.update(processing_status)
         for destination_key, _ in PIPELINE_CTA_RELATIVE_PATHS:
             if destination_key in destination_results:
@@ -773,7 +817,11 @@ def prepare_batch_data(
                 row["{0}_cta_sha256".format(destination_key)] = destination_hash
         rows.append(row)
 
-    _write_manifest_atomic(manifest_path, rows)
+    _write_manifest_atomic(
+        manifest_path,
+        rows,
+        additional_fieldnames=additional_manifest_fields,
+    )
 
     return PreparationResult(
         case_count=len(plans),

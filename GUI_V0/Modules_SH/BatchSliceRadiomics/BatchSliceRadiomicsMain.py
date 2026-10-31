@@ -1,21 +1,38 @@
 import csv
 import errno
 import hashlib
+import io
 import locale
+import multiprocessing
 import os
+import queue
+import re
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+import traceback
+from collections import Counter
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
+from concurrent.futures.process import BrokenProcessPool
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 import json
 import numpy
 import SimpleITK as sitk
+from PySide2.QtCore import QObject, QThread, Signal, Slot
+from PySide2.QtWidgets import QMessageBox
 
 try:
     import psutil
@@ -61,6 +78,19 @@ ATOMIC_REPLACE_MAX_DELAY_SECONDS = 0.5
 POST_WRITE_VALIDATION_ATTEMPTS = 4
 POST_WRITE_VALIDATION_DELAY_SECONDS = 0.05
 HASH_BLOCK_SIZE = 1024 * 1024
+DEFAULT_PARALLEL_WORKERS = 4
+PENDING_RECORD_FOLDER = 'pending'
+PENDING_COMPACT_INTERVAL = 25
+MANIFEST_MERGE_INTERVAL = 100
+WORKER_OUTPUT_TAIL_LENGTH = 16000
+LOG_SUMMARY_INTERVAL_SECONDS = 30
+DEFAULT_WORKING_ROOT = (
+    'S:/04_JZ/FishAndChips_C2/0_Initial_Segmentation'
+)
+DEFAULT_MANIFEST_PATH = (
+    DEFAULT_WORKING_ROOT + '/' + DEFAULT_MANIFEST_FILE_NAME
+)
+DEFAULT_FAILED_ROOT = 'S:/04_JZ/FishAndChips_C2'
 
 
 def _artery_status_fields(artery):
@@ -127,6 +157,171 @@ XSECTION_RECORD_FIELDS = (
     'batch_name',
     'case_relative_path',
 ) + XSECTION_STATUS_FIELDS + XSECTION_LOCAL_FIELDS + XSECTION_FINGERPRINT_FIELDS
+
+
+@dataclass(frozen=True)
+class BatchSliceRunConfig:
+    """Immutable, spawn-safe settings captured from the GUI for one run."""
+
+    root_path: str
+    manifest_path: str
+    failed_root_path: str
+    cpr_exe_path: str
+    lumen_process_path: str
+    max_workers: int = DEFAULT_PARALLEL_WORKERS
+    copy_files: bool = False
+    copy_origin_dir: str = ''
+    file_references: tuple = ()
+    copy_number_limit: int = 20
+    scan_dicom: bool = False
+    create_folders: bool = True
+    branch_dictionary: bool = True
+    generate_tables: bool = True
+    filter_mask: bool = True
+    xsection: bool = True
+    lumen_correction: bool = True
+    mask_xsection: bool = True
+    mask_xsection_only: bool = False
+    rerun_failed: bool = False
+    selected_arteries: tuple = XSECTION_ARTERY_NAMES
+    xsection_timeout_seconds: int = DEFAULT_XSECTION_TIMEOUT_MINUTES * 60
+    resample_depth: str = '0.1'
+    cpr_angle: str = '0'
+    ignore_coordinates: str = ''
+
+    @property
+    def enabled_stages(self):
+        stages = []
+        if self.filter_mask:
+            stages.append('Filter Mask')
+        if self.xsection:
+            stages.append('Xsection')
+        if self.lumen_correction:
+            stages.append('Lumen Correction')
+        return tuple(stages)
+
+
+@dataclass(frozen=True)
+class CaseArteryApplicability:
+    """Verified selected arteries which are usable for one case."""
+
+    reliable: bool
+    applicable_arteries: tuple
+    source_fingerprint: str
+    error_message: str = ''
+
+
+@dataclass(frozen=True)
+class BatchSliceWorkUnit:
+    """One independently schedulable batch or case."""
+
+    unit_id: str
+    layout: str
+    working_dir: str
+    batch_name: str
+    case_paths: tuple
+    table_dir: str
+    record_path: str
+    canonical_record_path: str
+
+    @property
+    def case_count(self):
+        return len(self.case_paths)
+
+    @property
+    def case_ids(self):
+        return tuple(Path(path).name for path in self.case_paths)
+
+
+@dataclass(frozen=True)
+class BatchSliceDiscovery:
+    """Read-only inventory of a selected root and its manifest coverage."""
+
+    layout: str
+    work_units: tuple
+    discovered_count: int
+    excluded_count: int
+    manifest_only_count: int
+    out_of_scope_count: int
+    scope_batch_names: tuple
+
+
+@dataclass(frozen=True)
+class BatchSliceProgress:
+    """Small event passed from a process worker to the coordinator."""
+
+    kind: str
+    unit_id: str = ''
+    batch_name: str = ''
+    case_id: str = ''
+    stage: str = ''
+    state: str = ''
+    message: str = ''
+    timestamp: float = 0.0
+    process_id: int = 0
+
+
+@dataclass(frozen=True)
+class BatchSliceProgressSnapshot:
+    total_cases: int
+    total_steps: int
+    done_steps: int
+    completed_cases: int
+    skipped_cases: int
+    failed_cases: int
+    active_workers: int
+    stage_counts: tuple
+    elapsed_seconds: float
+    eta_seconds: float
+    percent: int
+
+
+@dataclass(frozen=True)
+class BatchSliceWorkResult:
+    unit_id: str
+    layout: str
+    batch_name: str
+    case_count: int
+    completed_cases: int
+    skipped_cases: int
+    failed_cases: int
+    record_path: str
+    duration_seconds: float
+    error_message: str = ''
+    output_tail: str = ''
+
+
+@dataclass(frozen=True)
+class BatchSliceRunResult:
+    discovery: BatchSliceDiscovery
+    work_results: tuple
+    worker_count: int
+    manifest_path: str
+    log_path: str
+    duration_seconds: float
+
+
+class _BoundedTextBuffer(io.TextIOBase):
+    """Capture only the tail of noisy legacy output in each worker."""
+
+    def __init__(self, limit=WORKER_OUTPUT_TAIL_LENGTH):
+        super().__init__()
+        self.limit = max(1, int(limit))
+        self._value = ''
+
+    def writable(self):
+        return True
+
+    def write(self, value):
+        value = str(value)[-self.limit:]
+        self._value = (self._value + value)[-self.limit:]
+        return len(value)
+
+    def flush(self):
+        return None
+
+    def tail(self):
+        return self._value.strip()
 
 
 def _widget_text(widget):
@@ -529,6 +724,483 @@ def merge_xsection_records(manifest_path, record_path, lock_timeout=LOCK_TIMEOUT
     }
 
 
+def _case_input_candidates(case_path):
+    case_path = Path(case_path)
+    return (
+        case_path / 'Preproc' / 'OriData' / 'CTA.nii.gz',
+        case_path / 'CTA' / 'CTA.nii.gz',
+    )
+
+
+def _contains_dicom(case_path):
+    for root, directory_names, file_names in os.walk(str(case_path)):
+        directory_names[:] = [
+            name for name in directory_names if name.casefold() != 'table'
+        ]
+        if any(
+                str(name).casefold().endswith('.dcm')
+                and _is_nonempty_regular_file(Path(root) / name)
+                for name in file_names):
+            return True
+    return False
+
+
+def _is_case_directory(case_path, scan_dicom=False):
+    case_path = Path(case_path)
+    if not case_path.is_dir():
+        return False
+    if scan_dicom:
+        return _contains_dicom(case_path)
+    return any(path.is_file() for path in _case_input_candidates(case_path))
+
+
+def _safe_unit_token(batch_name, case_id=''):
+    identity = '{0}\0{1}'.format(batch_name, case_id)
+    digest = hashlib.sha256(identity.encode('utf-8')).hexdigest()[:12]
+    readable = re.sub(
+        r'[^A-Za-z0-9_.-]+', '_',
+        '{0}_{1}'.format(batch_name, case_id).strip('_'),
+    ).strip('._')
+    return '{0}_{1}'.format(readable[:80] or 'work', digest)
+
+
+def derive_nearby_manifest(root_path, requested_path=''):
+    """Resolve a manifest near ``root_path`` when the UI still has its default."""
+
+    root_path = Path(root_path)
+    requested_text = str(requested_path or '').strip()
+    configured_is_default = (
+        requested_text
+        and os.path.normcase(os.path.abspath(requested_text))
+        == os.path.normcase(os.path.abspath(DEFAULT_MANIFEST_PATH))
+    )
+    root_uses_default = _path_is_within(root_path, DEFAULT_WORKING_ROOT)
+    if requested_text and (not configured_is_default or root_uses_default):
+        return str(Path(requested_text))
+
+    candidates = [
+        root_path / DEFAULT_MANIFEST_FILE_NAME,
+        root_path.parent / DEFAULT_MANIFEST_FILE_NAME,
+    ]
+    try:
+        candidates.extend(sorted(
+            (
+                child / DEFAULT_MANIFEST_FILE_NAME
+                for child in root_path.parent.iterdir()
+                if child.is_dir()
+            ),
+            key=lambda path: str(path).casefold(),
+        ))
+    except OSError:
+        pass
+    seen = set()
+    for candidate in candidates:
+        candidate_key = os.path.normcase(os.path.abspath(str(candidate)))
+        if candidate_key in seen:
+            continue
+        seen.add(candidate_key)
+        if candidate.is_file():
+            return str(candidate)
+    if root_path.name.casefold().startswith('batch_'):
+        return str(root_path.parent / DEFAULT_MANIFEST_FILE_NAME)
+    return str(root_path / DEFAULT_MANIFEST_FILE_NAME)
+
+
+def derive_failed_root(root_path, requested_path=''):
+    root_path = Path(root_path)
+    requested_text = str(requested_path or '').strip()
+    configured_is_default = (
+        requested_text
+        and os.path.normcase(os.path.abspath(requested_text))
+        == os.path.normcase(os.path.abspath(DEFAULT_FAILED_ROOT))
+    )
+    root_uses_default = _path_is_within(root_path, DEFAULT_WORKING_ROOT)
+    if requested_text and (not configured_is_default or root_uses_default):
+        return str(Path(requested_text))
+    return str(root_path.parent)
+
+
+def discover_batch_slice_work(root_or_config, manifest_path='', scan_dicom=None):
+    """Discover nested batches or direct cases without modifying either source."""
+
+    if isinstance(root_or_config, BatchSliceRunConfig):
+        config = root_or_config
+        root_path = Path(config.root_path)
+        manifest_path = manifest_path or config.manifest_path
+        if scan_dicom is None:
+            scan_dicom = config.scan_dicom
+    else:
+        root_path = Path(root_or_config)
+    scan_dicom = bool(scan_dicom)
+    if not root_path.is_dir():
+        raise NotADirectoryError(
+            'Working directory does not exist: {0}'.format(root_path)
+        )
+
+    direct_children = sorted(
+        (path for path in root_path.iterdir() if path.is_dir()),
+        key=lambda path: path.name.casefold(),
+    )
+    batch_paths = [
+        path for path in direct_children
+        if path.name.casefold().startswith('batch_')
+    ]
+    direct_case_paths = [
+        path for path in direct_children
+        if path.name.casefold() != 'table'
+        and path not in batch_paths
+        and _is_case_directory(path, scan_dicom=scan_dicom)
+    ]
+    nested_cases = {}
+    for batch_path in batch_paths:
+        nested_cases[batch_path] = tuple(sorted(
+            (
+                path for path in batch_path.iterdir()
+                if path.is_dir()
+                and path.name.casefold() != 'table'
+                and _is_case_directory(path, scan_dicom=scan_dicom)
+            ),
+            key=lambda path: path.name.casefold(),
+        ))
+
+    has_nested_cases = any(nested_cases.values())
+    if has_nested_cases and direct_case_paths:
+        raise ValueError(
+            'Mixed input layout: the selected root contains both batch_* '
+            'folders and direct case folders. Select either the parent of '
+            'the batches or one batch folder.'
+        )
+
+    work_units = []
+    excluded_count = 0
+    if has_nested_cases or (batch_paths and not direct_case_paths):
+        layout = 'nested_batches'
+        for batch_path in batch_paths:
+            case_paths = nested_cases.get(batch_path, ())
+            child_directories = [
+                path for path in batch_path.iterdir()
+                if path.is_dir() and path.name.casefold() != 'table'
+            ]
+            excluded_count += max(0, len(child_directories) - len(case_paths))
+            if not case_paths:
+                continue
+            table_dir = batch_path / 'Table'
+            record_path = (
+                table_dir / XSECTION_RECORD_FOLDER / XSECTION_RECORD_FILE
+            )
+            work_units.append(BatchSliceWorkUnit(
+                unit_id='batch:{0}'.format(batch_path.name),
+                layout=layout,
+                working_dir=str(batch_path),
+                batch_name=batch_path.name,
+                case_paths=tuple(str(path) for path in case_paths),
+                table_dir=str(table_dir),
+                record_path=str(record_path),
+                canonical_record_path=str(record_path),
+            ))
+        excluded_count += sum(
+            1 for path in direct_children
+            if path.name.casefold() != 'table' and path not in batch_paths
+        )
+        work_units.sort(
+            key=lambda unit: (-unit.case_count, unit.batch_name.casefold())
+        )
+    else:
+        layout = 'direct_cases'
+        table_root = root_path / 'Table'
+        record_root = table_root / XSECTION_RECORD_FOLDER
+        canonical_record_path = record_root / XSECTION_RECORD_FILE
+        excluded_count = sum(
+            1 for path in direct_children
+            if path.name.casefold() != 'table' and path not in direct_case_paths
+        )
+        for case_path in direct_case_paths:
+            token = _safe_unit_token(root_path.name, case_path.name)
+            work_units.append(BatchSliceWorkUnit(
+                unit_id='case:{0}:{1}'.format(root_path.name, case_path.name),
+                layout=layout,
+                working_dir=str(root_path),
+                batch_name=root_path.name,
+                case_paths=(str(case_path),),
+                table_dir=str(table_root / 'case_workers' / token),
+                record_path=str(
+                    record_root / PENDING_RECORD_FOLDER /
+                    ('{0}.csv'.format(token))
+                ),
+                canonical_record_path=str(canonical_record_path),
+            ))
+
+    discovered_identities = {
+        (unit.batch_name.casefold(), case_id.casefold())
+        for unit in work_units for case_id in unit.case_ids
+    }
+    discovered_case_ids = {
+        case_id for _, case_id in discovered_identities
+    }
+    scope_batch_names = tuple(sorted(
+        {unit.batch_name for unit in work_units}, key=str.casefold
+    ))
+    scope_batch_keys = {name.casefold() for name in scope_batch_names}
+    manifest_only_count = 0
+    out_of_scope_count = 0
+    _, manifest_rows = _read_csv_rows(manifest_path)
+    for row in manifest_rows:
+        case_id = str(row.get('case_id', '')).strip()
+        batch_name = str(row.get('batch_name', '')).strip()
+        if not case_id:
+            continue
+        identity = (batch_name.casefold(), case_id.casefold())
+        if identity in discovered_identities:
+            continue
+        if not batch_name and case_id.casefold() in discovered_case_ids:
+            continue
+        if batch_name.casefold() in scope_batch_keys:
+            manifest_only_count += 1
+        else:
+            out_of_scope_count += 1
+
+    return BatchSliceDiscovery(
+        layout=layout,
+        work_units=tuple(work_units),
+        discovered_count=sum(unit.case_count for unit in work_units),
+        excluded_count=excluded_count,
+        manifest_only_count=manifest_only_count,
+        out_of_scope_count=out_of_scope_count,
+        scope_batch_names=scope_batch_names,
+    )
+
+
+def clamp_parallel_workers(requested, unit_count, logical_cpus=None):
+    logical_cpus = max(1, int(logical_cpus or os.cpu_count() or 1))
+    unit_count = max(0, int(unit_count))
+    if unit_count == 0:
+        return 0
+    try:
+        requested = int(requested)
+    except (TypeError, ValueError):
+        requested = DEFAULT_PARALLEL_WORKERS
+    return min(max(1, requested), unit_count, logical_cpus)
+
+
+def _seed_pending_ledger(canonical_path, pending_path, batch_name, case_id):
+    canonical_path = Path(canonical_path)
+    pending_path = Path(pending_path)
+    with interprocess_file_lock(str(canonical_path) + '.lock'):
+        _, canonical_rows = _read_csv_rows(canonical_path)
+    identity = (str(batch_name).casefold(), str(case_id).casefold())
+    matching_rows = [
+        row for row in canonical_rows
+        if (
+            str(row.get('batch_name', '')).strip().casefold(),
+            str(row.get('case_id', '')).strip().casefold(),
+        ) == identity
+    ]
+    if not matching_rows:
+        legacy_rows = [
+            row for row in canonical_rows
+            if (
+                not str(row.get('batch_name', '')).strip()
+                and str(row.get('case_id', '')).strip().casefold()
+                == identity[1]
+            )
+        ]
+        if len(legacy_rows) == 1:
+            adopted_row = dict(legacy_rows[0])
+            adopted_row['batch_name'] = str(batch_name)
+            matching_rows = [adopted_row]
+    write_xsection_records(pending_path, matching_rows[:1])
+    return pending_path
+
+
+def compact_pending_ledgers(
+        canonical_path,
+        pending_dir=None,
+        manifest_path=None,
+        pending_paths=None):
+    """Atomically merge private case ledgers into the canonical flat ledger."""
+
+    canonical_path = Path(canonical_path)
+    if pending_paths is None:
+        pending_dir = Path(
+            pending_dir
+            or canonical_path.parent / PENDING_RECORD_FOLDER
+        )
+        pending_paths = sorted(
+            pending_dir.glob('*.csv') if pending_dir.is_dir() else (),
+            key=lambda path: path.name.casefold(),
+        )
+    else:
+        pending_paths = [Path(path) for path in pending_paths]
+
+    pending_records = []
+    pending_signatures = {}
+    errors = []
+    for pending_path in pending_paths:
+        try:
+            with interprocess_file_lock(str(pending_path) + '.lock'):
+                _, rows = _read_csv_rows(pending_path)
+                signature = _file_signature(
+                    pending_path, hash_contents=True
+                )
+            pending_records.extend(rows)
+            pending_signatures[pending_path] = signature
+        except Exception as error:
+            errors.append('{0}: {1}'.format(pending_path, error))
+
+    if pending_signatures:
+        with interprocess_file_lock(str(canonical_path) + '.lock'):
+            _, canonical_rows = _read_csv_rows(canonical_path)
+            record_map = {}
+            for row in canonical_rows:
+                case_id = str(row.get('case_id', '')).strip()
+                batch_name = str(row.get('batch_name', '')).strip()
+                if case_id and batch_name:
+                    record_map[(batch_name.casefold(), case_id.casefold())] = row
+            for row in pending_records:
+                case_id = str(row.get('case_id', '')).strip()
+                batch_name = str(row.get('batch_name', '')).strip()
+                if not case_id or not batch_name:
+                    continue
+                normalized = dict(XSECTION_STATUS_DEFAULTS)
+                normalized.update(XSECTION_LOCAL_DEFAULTS)
+                normalized.update({
+                    field_name: ''
+                    for field_name in XSECTION_FINGERPRINT_FIELDS
+                })
+                normalized.update(row)
+                normalized['case_id'] = case_id
+                normalized['batch_name'] = batch_name
+                normalized.setdefault('case_relative_path', '')
+                record_map[(batch_name.casefold(), case_id.casefold())] = normalized
+            ordered_rows = sorted(
+                record_map.values(),
+                key=lambda row: (
+                    str(row.get('batch_name', '')).casefold(),
+                    str(row.get('case_id', '')).casefold(),
+                ),
+            )
+            _write_csv_atomic(
+                canonical_path, XSECTION_RECORD_FIELDS, ordered_rows
+            )
+
+        for pending_path, signature in pending_signatures.items():
+            try:
+                with interprocess_file_lock(str(pending_path) + '.lock'):
+                    if (
+                            pending_path.is_file()
+                            and _file_signature(
+                                pending_path, hash_contents=True
+                            ) == signature):
+                        pending_path.unlink()
+            except Exception as error:
+                errors.append('{0}: {1}'.format(pending_path, error))
+
+    manifest_result = None
+    if manifest_path and canonical_path.is_file():
+        manifest_result = merge_xsection_records(
+            manifest_path, canonical_path
+        )
+    return {
+        'canonical_path': str(canonical_path),
+        'pending_file_count': len(pending_signatures),
+        'record_count': len(pending_records),
+        'errors': tuple(errors),
+        'manifest_result': manifest_result,
+    }
+
+
+class BatchSliceProgressTracker:
+    """Coordinator-only monotonic case/stage progress accounting."""
+
+    def __init__(self, discovery, enabled_stages, started_at=None):
+        self.discovery = discovery
+        self.enabled_stages = tuple(enabled_stages)
+        self.started_at = started_at or time.monotonic()
+        self._active_units = set()
+        self._case_stages = {}
+        self._identities = {
+            (unit.batch_name, case_id)
+            for unit in discovery.work_units for case_id in unit.case_ids
+        }
+
+    def consume(self, event):
+        if event.kind in ('unit_submitted', 'unit_started'):
+            self._active_units.add(event.unit_id)
+        elif event.kind in ('unit_finished', 'unit_failed'):
+            self._active_units.discard(event.unit_id)
+        elif event.kind == 'case_stage':
+            key = (event.batch_name, event.case_id, event.stage)
+            if (
+                    event.stage in self.enabled_stages
+                    and event.state in ('completed', 'skipped', 'failed')
+                    and key not in self._case_stages):
+                self._case_stages[key] = event.state
+        return self.snapshot()
+
+    def fail_unit(self, unit):
+        for case_id in unit.case_ids:
+            for stage in self.enabled_stages:
+                self._case_stages.setdefault(
+                    (unit.batch_name, case_id, stage), 'failed'
+                )
+        self._active_units.discard(unit.unit_id)
+        return self.snapshot()
+
+    def snapshot(self):
+        elapsed = max(0.0, time.monotonic() - self.started_at)
+        total_steps = len(self._identities) * len(self.enabled_stages)
+        done_steps = len(self._case_stages)
+        final_states = Counter()
+        for batch_name, case_id in self._identities:
+            states = [
+                self._case_stages.get((batch_name, case_id, stage))
+                for stage in self.enabled_stages
+            ]
+            if self.enabled_stages and all(state is not None for state in states):
+                if 'failed' in states:
+                    final_states['failed'] += 1
+                elif all(state == 'skipped' for state in states):
+                    final_states['skipped'] += 1
+                else:
+                    final_states['completed'] += 1
+        stage_counts = []
+        for stage in self.enabled_stages:
+            counts = Counter(
+                state for (batch_name, case_id, current_stage), state
+                in self._case_stages.items() if current_stage == stage
+            )
+            stage_counts.append((
+                stage,
+                counts['completed'],
+                counts['skipped'],
+                counts['failed'],
+            ))
+        if total_steps:
+            percent = int(min(100, (100 * done_steps) // total_steps))
+        else:
+            percent = 100
+        eta = 0.0
+        if done_steps and done_steps < total_steps:
+            eta = elapsed * float(total_steps - done_steps) / done_steps
+        return BatchSliceProgressSnapshot(
+            total_cases=len(self._identities),
+            total_steps=total_steps,
+            done_steps=done_steps,
+            completed_cases=final_states['completed'],
+            skipped_cases=final_states['skipped'],
+            failed_cases=final_states['failed'],
+            active_workers=len(self._active_units),
+            stage_counts=tuple(stage_counts),
+            elapsed_seconds=elapsed,
+            eta_seconds=eta,
+            percent=percent,
+        )
+
+
+def summarize_progress(progress_tracker):
+    return progress_tracker.snapshot()
+
+
 def _terminate_process_tree(process, wait_seconds=5):
     errors = []
     if process is None or process.poll() is not None:
@@ -647,7 +1319,7 @@ def run_xsection_command(arguments, timeout_seconds, output_limit=MAX_XSECTION_E
     return result
 
 
-class BatchSliceRadiomics:
+class BatchSliceRadiomics(QObject):
     """Batch xsection orchestration with resumable, per-artifact outcomes."""
 
     FILTER_MASK_HEADERS = (
@@ -673,12 +1345,16 @@ class BatchSliceRadiomics:
             xsection_runner=None,
             lumen_runner=None,
             filter_mask_runner=None):
+        super().__init__()
         self.ui = UI
         self.model = Hedys
         self.modelui = Hedys.ui if Hedys is not None else None
         self._xsection_runner = xsection_runner or run_xsection_command
         self._lumen_runner = lumen_runner
         self._filter_mask_runner = filter_mask_runner
+        self._run_thread = None
+        self._run_coordinator = None
+        self._last_run_result = None
         self.initProcess()
 
         if self.ui is not None:
@@ -690,7 +1366,7 @@ class BatchSliceRadiomics:
             )
             self._connect_button('ChooseManifestPathBtn_BSRJZ', self.ChooseManifestPath)
             self._connect_button('ChooseFailedRootPathBtn_BSRJZ', self.ChooseFailedRootPath)
-            self._connect_button('RunBtn_CPP', self.mainFunction)
+            self._connect_button('RunBtn_CPP', self.startParallelRun)
             if self.modelui is not None:
                 self.modelui.QStackedWidget_Module.setCurrentWidget(self.ui.centralwidget)
 
@@ -727,15 +1403,27 @@ class BatchSliceRadiomics:
         self.LCProcessPath = None
         self.XsectionRecordPath = None
         self.RecordMap = {}
+        self._case_applicability = {}
         self._branch_validation_attempted = False
         self._validated_use_paths = {}
+        self._progress_callback = None
+        self._case_stage_states = {}
+        self._manifest_merge_enabled = True
+        self.InnerXsectionWorkers = None
+        self.ResampleDepth = '0.1'
+        self.CPRAngle = '0'
+        self.IgnoreCoordinates = ''
+        self.CopyFileReferences = ()
+        self.CopyNumberLimit = 20
+        self.WorkUnitID = ''
+        self.WorkUnitRecordPath = None
 
         self.CopyFileFlag = False
-        self.ScanFileFlag = True
+        self.ScanFileFlag = False
         self.CreateFolderFlag = True
-        self.BranchDictFlag = True
+        self.BranchDictFlag = False
         self.GenerateTFlag = True
-        self.FMFlag = True
+        self.FMFlag = False
         self.XsecFlag = True
         self.LCFlag = True
         self.MaskXsectionFlag = True
@@ -744,21 +1432,89 @@ class BatchSliceRadiomics:
         self.SelectedArteries = list(XSECTION_ARTERY_NAMES)
         self.XsectionTimeoutSeconds = DEFAULT_XSECTION_TIMEOUT_MINUTES * 60
 
+    def _emit_progress(
+            self,
+            kind,
+            case_id='',
+            stage='',
+            state='',
+            message=''):
+        if self._progress_callback is None:
+            return
+        event = BatchSliceProgress(
+            kind=kind,
+            unit_id=getattr(self, 'WorkUnitID', ''),
+            batch_name=str(self.BatchName or ''),
+            case_id=str(case_id or ''),
+            stage=str(stage or ''),
+            state=str(state or ''),
+            message=str(message or ''),
+            timestamp=time.time(),
+            process_id=os.getpid(),
+        )
+        try:
+            self._progress_callback(event)
+        except Exception:
+            # Progress reporting must never invalidate scientific outputs.
+            pass
+
+    def _emit_case_stage(self, case_path, stage, state, message=''):
+        identity = (str(Path(case_path).name), str(stage))
+        if identity in self._case_stage_states:
+            return
+        self._case_stage_states[identity] = str(state)
+        self._emit_progress(
+            'case_stage',
+            case_id=identity[0],
+            stage=stage,
+            state=state,
+            message=message,
+        )
+
+    def _case_result_counts(self):
+        stages = []
+        if self.FMFlag:
+            stages.append('Filter Mask')
+        if self.XsecFlag:
+            stages.append('Xsection')
+        if self.LCFlag:
+            stages.append('Lumen Correction')
+        counts = Counter()
+        for case_path_text in self.DCMDirList:
+            case_id = Path(case_path_text).name
+            states = [
+                self._case_stage_states.get((case_id, stage))
+                for stage in stages
+            ]
+            if not stages or any(state is None for state in states):
+                counts['failed'] += 1
+            elif 'failed' in states:
+                counts['failed'] += 1
+            elif all(state == 'skipped' for state in states):
+                counts['skipped'] += 1
+            else:
+                counts['completed'] += 1
+        return counts
+
     def CheckCheckBoxStatus(self):
         if self.ui is None:
             return
         self.CopyFileFlag = _widget_checked(getattr(self.ui, 'CopyFile_CB_BSRJZ', None))
-        self.ScanFileFlag = _widget_checked(getattr(self.ui, 'ScanFile_CB_BSRJZ', None), True)
+        self.ScanFileFlag = _widget_checked(
+            getattr(self.ui, 'ScanFile_CB_BSRJZ', None), False
+        )
         self.CreateFolderFlag = _widget_checked(
             getattr(self.ui, 'CreateFolders_CB_BSRJZ', None), True
         )
         self.BranchDictFlag = _widget_checked(
-            getattr(self.ui, 'BranchDict_CB_BSRJZ', None), True
+            getattr(self.ui, 'BranchDict_CB_BSRJZ', None), False
         )
         self.GenerateTFlag = _widget_checked(
             getattr(self.ui, 'GenerateTable_CB_BSRJZ', None), True
         )
-        self.FMFlag = _widget_checked(getattr(self.ui, 'FM_CB_BSRJZ', None), True)
+        self.FMFlag = _widget_checked(
+            getattr(self.ui, 'FM_CB_BSRJZ', None), False
+        )
         self.XsecFlag = _widget_checked(
             getattr(self.ui, 'Xsection_CB_BSRJZ', None), True
         )
@@ -860,7 +1616,10 @@ class BatchSliceRadiomics:
         working_root = Path(self.WorkingDir)
         case_paths = set()
         for root, _, files in os.walk(str(working_root)):
-            if not any(str(file_name).lower().endswith('.dcm') for file_name in files):
+            if not any(
+                    str(file_name).lower().endswith('.dcm')
+                    and _is_nonempty_regular_file(Path(root) / file_name)
+                    for file_name in files):
                 continue
             try:
                 relative_parts = Path(root).relative_to(working_root).parts
@@ -952,7 +1711,8 @@ class BatchSliceRadiomics:
         self.XsectionFixTablePath = str(table_dir / 'XsectionFix_BSRJZ.csv')
         self.LCProcessPath = str(table_dir / 'LCProcess_BSRJZ.csv')
         self.XsectionRecordPath = str(
-            table_dir / XSECTION_RECORD_FOLDER / XSECTION_RECORD_FILE
+            self.WorkUnitRecordPath
+            or table_dir / XSECTION_RECORD_FOLDER / XSECTION_RECORD_FILE
         )
 
     # input path, join path with json file, return a list include l and r json file path
@@ -971,7 +1731,7 @@ class BatchSliceRadiomics:
         branch_list = list(self.SelectedArteries)
         ignore_text = _widget_text(
             getattr(self.ui, 'ignoreCheck_Txt_BSRJZ', None)
-        ) if self.ui is not None else ''
+        ) if self.ui is not None else self.IgnoreCoordinates
         ignore_coordinates = Preprocess_Mask.StrToLst(
             strIn=ignore_text
         )["listOut"]
@@ -1059,6 +1819,207 @@ class BatchSliceRadiomics:
             return suffixed_path
         return csv_path / 'coronarySegmentsUse.json'
 
+    def _applicability_key(self, case_path):
+        return self._record_key(self.BatchName, Path(case_path).name)
+
+    def _selected_use_arteries(self, branches):
+        if not isinstance(branches, list):
+            raise ValueError('artery-use JSON must contain a list')
+        selected = set(self.SelectedArteries)
+        seen = set()
+        applicable = set()
+        for branch in branches:
+            if not isinstance(branch, dict):
+                raise ValueError('artery-use JSON entries must be objects')
+            artery = str(branch.get('branch_name', '')).strip()
+            if artery not in selected:
+                continue
+            if artery in seen:
+                raise ValueError(
+                    'artery-use JSON contains duplicate {0} entries'.format(artery)
+                )
+            seen.add(artery)
+            if branch.get('use'):
+                applicable.add(artery)
+        return tuple(
+            artery for artery in self.SelectedArteries if artery in applicable
+        )
+
+    def _cache_reliable_applicability(
+            self, case_path, use_json_path, branches, case_table_path):
+        case_path = Path(case_path)
+        use_json_path = Path(use_json_path)
+        case_table_path = Path(case_table_path)
+        contract = CaseArteryApplicability(
+            reliable=True,
+            applicable_arteries=self._selected_use_arteries(branches),
+            source_fingerprint=_fingerprint((
+                'case-applicability-v1',
+                str(case_path.resolve()),
+                *self.SelectedArteries,
+                _file_signature(use_json_path, hash_contents=True),
+                _file_signature(case_table_path, hash_contents=True),
+            )),
+        )
+        self._case_applicability[self._applicability_key(case_path)] = contract
+        return contract
+
+    def _cache_unreliable_applicability(
+            self, case_path, error_message, use_json_path=None):
+        case_path = Path(case_path)
+        source_signature = (
+            _file_signature(use_json_path, hash_contents=True)
+            if use_json_path is not None else 'missing:artery-use-json'
+        )
+        error_message = _clean_error_message(
+            'Cannot verify per-case artery applicability: {0}'.format(
+                error_message
+            )
+        )
+        contract = CaseArteryApplicability(
+            reliable=False,
+            applicable_arteries=tuple(self.SelectedArteries),
+            source_fingerprint=_fingerprint((
+                'case-applicability-v1',
+                'unreliable',
+                str(case_path.resolve()),
+                *self.SelectedArteries,
+                source_signature,
+                error_message,
+            )),
+            error_message=error_message,
+        )
+        self._case_applicability[self._applicability_key(case_path)] = contract
+        return contract
+
+    def _reconstruct_case_applicability(self, case_path):
+        """Verify applicability from durable JSON and generated table markers."""
+
+        case_path = Path(case_path)
+        use_json_path = None
+        try:
+            csv_path = case_path / 'Preproc' / 'CSV'
+            use_json_path = self._case_use_json(csv_path)
+            with Path(use_json_path).open('r', encoding='utf-8') as json_file:
+                branches = json.load(json_file)
+            self._selected_use_arteries(branches)
+
+            table_path = Path(self.XsectionTablePath)
+            if not table_path.is_file():
+                legacy_path = Path(self.TableDir) / 'Xsection.csv'
+                if legacy_path.is_file():
+                    table_path = legacy_path
+            table_headers, table_rows = _read_csv_rows(table_path)
+            if not set(self.XSECTION_HEADERS).issubset(table_headers):
+                raise ValueError(
+                    'Xsection table is missing its required header: {0}'.format(
+                        table_path
+                    )
+                )
+
+            matching_rows = []
+            for row in table_rows:
+                case_table_text = str(row.get('casePath', '')).strip()
+                if not case_table_text:
+                    continue
+                candidate = Path(case_table_text)
+                if not candidate.is_absolute():
+                    candidate = table_path.parent / candidate
+                if _path_is_within(candidate, case_path):
+                    matching_rows.append((row, candidate))
+            if len(matching_rows) != 1:
+                raise ValueError(
+                    'expected one successful Xsection table marker for {0}; '
+                    'found {1}'.format(case_path.name, len(matching_rows))
+                )
+
+            _, case_table_path = matching_rows[0]
+            case_headers, _ = _read_csv_rows(case_table_path)
+            if tuple(case_headers) != tuple(self.CASE_HEADERS):
+                raise ValueError(
+                    'case table has an invalid header: {0}'.format(
+                        case_table_path
+                    )
+                )
+            return self._cache_reliable_applicability(
+                case_path,
+                use_json_path,
+                branches,
+                case_table_path,
+            )
+        except Exception as error:
+            return self._cache_unreliable_applicability(
+                case_path, error, use_json_path=use_json_path
+            )
+
+    def _case_artery_applicability(self, case_path):
+        case_path = Path(case_path)
+        key = self._applicability_key(case_path)
+        contract = self._case_applicability.get(key)
+        if contract is None:
+            contract = self._reconstruct_case_applicability(case_path)
+        return contract
+
+    def _record_applicable_arteries(self, record):
+        key = self._record_key(
+            record.get('batch_name', ''), record.get('case_id', '')
+        )
+        contract = self._case_applicability.get(key)
+        if contract is None and key[0] == str(self.BatchName).casefold():
+            case_id = key[1]
+            case_path = next((
+                Path(path) for path in self.DCMDirList
+                if Path(path).name.casefold() == case_id
+            ), None)
+            if case_path is not None:
+                contract = self._case_artery_applicability(case_path)
+        if contract is None or not contract.reliable:
+            return tuple(self.SelectedArteries)
+        return tuple(contract.applicable_arteries)
+
+    def _not_applicable_fingerprint(
+            self, case_path, artery, stage, contract):
+        return _fingerprint((
+            'not-applicable-v1',
+            contract.source_fingerprint,
+            str(Path(case_path).resolve()),
+            artery,
+            stage,
+        ))
+
+    def _normalize_not_applicable_artery(
+            self, record, case_path, artery, contract):
+        """Clear stale failures without claiming that an artifact exists."""
+
+        filter_complete, filter_message, filter_fingerprint = (
+            _filter_mask_status_fields(artery)
+        )
+        record[filter_complete] = 0
+        record[filter_message] = ''
+        record[filter_fingerprint] = self._not_applicable_fingerprint(
+            case_path, artery, 'filter-mask', contract
+        )
+        for artifact_type in ('CTA', 'seg'):
+            failed, message, complete, fingerprint = self._xsection_fields(
+                artery, artifact_type
+            )
+            record[failed] = 0
+            record[message] = ''
+            record[complete] = 0
+            record[fingerprint] = self._not_applicable_fingerprint(
+                case_path,
+                artery,
+                'xsection-{0}'.format(artifact_type),
+                contract,
+            )
+        record['{0}_lumen_complete'.format(artery)] = 0
+        record['{0}_lumen_er_msg'.format(artery)] = ''
+        record['{0}_lumen_fingerprint'.format(artery)] = (
+            self._not_applicable_fingerprint(
+                case_path, artery, 'lumen', contract
+            )
+        )
+
     @staticmethod
     def _write_table(path, headers, rows):
         dictionaries = [
@@ -1066,6 +2027,52 @@ class BatchSliceRadiomics:
             for row in rows
         ]
         _write_csv_atomic(path, list(headers), dictionaries)
+
+    def _stage_existing_case_tables(self, shared_table_dir, case_path):
+        """Copy only one case's legacy/shared rows into its private tables."""
+
+        shared_table_dir = Path(shared_table_dir)
+        case_path = Path(case_path)
+        specifications = (
+            (
+                ('FilterMask_BSRJZ.csv', 'FilterMask.csv'),
+                self.FilterMaskTablePath,
+                self.FILTER_MASK_HEADERS,
+                ('OutputFolder',),
+            ),
+            (
+                ('Xsection_BSRJZ.csv', 'Xsection.csv'),
+                self.XsectionTablePath,
+                self.XSECTION_HEADERS,
+                ('inputDir', 'outputDir', 'casePath'),
+            ),
+            (
+                ('XsectionFix_BSRJZ.csv', 'XsectionFix.csv'),
+                self.XsectionFixTablePath,
+                self.XSECTION_FIX_HEADERS,
+                ('Image Path', 'Mask Path', 'Output Directory'),
+            ),
+        )
+        for source_names, destination, headers, path_fields in specifications:
+            source_path = next((
+                shared_table_dir / source_name
+                for source_name in source_names
+                if (shared_table_dir / source_name).is_file()
+            ), None)
+            rows = []
+            if source_path is not None:
+                _, source_rows = _read_csv_rows(source_path)
+                rows = [
+                    row for row in source_rows
+                    if any(
+                        str(row.get(field_name, '')).strip()
+                        and _path_is_within(
+                            row.get(field_name, ''), case_path
+                        )
+                        for field_name in path_fields
+                    )
+                ]
+            self._write_table(destination, headers, rows)
 
     def _prepare_lumen_process(self):
         source_path = Path(self.LumenProcessSourcePath or '')
@@ -1114,6 +2121,7 @@ class BatchSliceRadiomics:
         self.FilterMaskTable = []
         self.XsectionTable = []
         self.XsectionFixTable = []
+        self._case_applicability = {}
         successful_cases = []
 
         for case_index, csv_path_text in enumerate(self.CSVPathList):
@@ -1121,13 +2129,14 @@ class BatchSliceRadiomics:
             case_path = Path(self.DCMDirList[case_index])
             case_rows = []
             filter_checkpoint = len(self.FilterMaskTable)
+            xsection_checkpoint = len(self.XsectionTable)
             fix_checkpoint = len(self.XsectionFixTable)
+            use_json_path = None
             try:
                 use_json_path = self._case_use_json(csv_path)
                 with use_json_path.open('r', encoding='utf-8') as json_file:
                     branches = json.load(json_file)
-                if not isinstance(branches, list):
-                    raise ValueError('artery-use JSON must contain a list')
+                self._selected_use_arteries(branches)
 
                 for branch in branches:
                     artery = str(branch.get('branch_name', ''))
@@ -1207,10 +2216,20 @@ class BatchSliceRadiomics:
                     str(case_table_path),
                     self.CPREXEPath,
                 ])
+                self._cache_reliable_applicability(
+                    case_path,
+                    use_json_path,
+                    branches,
+                    case_table_path,
+                )
                 successful_cases.append(str(case_path))
             except Exception as error:
                 del self.FilterMaskTable[filter_checkpoint:]
+                del self.XsectionTable[xsection_checkpoint:]
                 del self.XsectionFixTable[fix_checkpoint:]
+                self._cache_unreliable_applicability(
+                    case_path, error, use_json_path=use_json_path
+                )
                 self.UpdateMsgLog(
                     'Table generation failed; continuing: {0}: {1}'.format(
                         case_path.name, error
@@ -1255,11 +2274,33 @@ class BatchSliceRadiomics:
         skipped_failed_arteries = 0
         completed_arteries = 0
         incomplete_arteries = 0
+        not_applicable_arteries = 0
         table_error_cases = 0
         for case_path_text, branch_path_text in zip(
                 self.DCMDirList, self.BranchPathList):
             case_path = Path(case_path_text)
             record = self._ensure_case_record(record_map, case_path)
+            applicability = self._case_artery_applicability(case_path)
+            required_arteries = tuple(applicability.applicable_arteries)
+            not_applicable = (
+                tuple(
+                    artery for artery in self.SelectedArteries
+                    if artery not in required_arteries
+                )
+                if applicability.reliable else ()
+            )
+            artery_outcomes = {}
+            for artery in not_applicable:
+                self._normalize_not_applicable_artery(
+                    record, case_path, artery, applicability
+                )
+                artery_outcomes[artery] = {
+                    'complete': True,
+                    'skipped': True,
+                    'not_applicable': True,
+                    'error_message': '',
+                }
+                not_applicable_arteries += 1
             legacy_filter_complete = record.get('filter_mask_complete', 0)
             legacy_filter_error = record.get('filter_mask_er_msg', '')
             legacy_filter_fingerprint = record.get(
@@ -1272,10 +2313,18 @@ class BatchSliceRadiomics:
             artery_expected_paths = {}
             artery_fingerprint_parts = {}
             artery_preflight_errors = {
-                artery: [] for artery in self.SelectedArteries
+                artery: [] for artery in required_arteries
             }
-            fingerprint_parts = ['filter-mask-v1']
+            fingerprint_parts = [
+                'filter-mask-v2', applicability.source_fingerprint
+            ]
             case_preflight_errors = []
+            if not applicability.reliable:
+                case_preflight_errors.append(applicability.error_message)
+                for artery in required_arteries:
+                    artery_preflight_errors[artery].append(
+                        applicability.error_message
+                    )
             source_signatures = {}
             for row in case_rows:
                 mask_path = Path(str(row.get('MaskPath', '')).strip())
@@ -1293,6 +2342,11 @@ class BatchSliceRadiomics:
                         artery_name.casefold()
                     )
                 ), None)
+                if (
+                        artery is not None
+                        and applicability.reliable
+                        and artery not in required_arteries):
+                    continue
                 if artery is None:
                     case_preflight_errors.append(
                         'Cannot identify Filter Mask artery from FileNameRef: '
@@ -1371,7 +2425,7 @@ class BatchSliceRadiomics:
                 for artery, parts in artery_fingerprint_parts.items()
             }
             missing_arteries = [
-                artery for artery in self.SelectedArteries
+                artery for artery in required_arteries
                 if artery not in artery_expected_paths
             ]
             for artery in missing_arteries:
@@ -1379,8 +2433,7 @@ class BatchSliceRadiomics:
                     'No Filter Mask row for {0}'.format(artery)
                 )
             record['filter_mask_fingerprint'] = fingerprint
-            artery_outcomes = {}
-            for artery in self.SelectedArteries:
+            for artery in required_arteries:
                 complete_field, message_field, fingerprint_field = (
                     _filter_mask_status_fields(artery)
                 )
@@ -1391,6 +2444,7 @@ class BatchSliceRadiomics:
                         'missing-row',
                         str(case_path.resolve()),
                         artery,
+                        applicability.source_fingerprint,
                     ))
                 expected_paths = artery_expected_paths.get(artery, ())
                 preflight_errors = artery_preflight_errors[artery]
@@ -1585,15 +2639,15 @@ class BatchSliceRadiomics:
                 '{0}: {1}'.format(
                     artery, artery_outcomes[artery]['error_message']
                 )
-                for artery in self.SelectedArteries
+                for artery in required_arteries
                 if artery_outcomes[artery]['error_message']
             ]
             artery_messages.extend(case_preflight_errors)
             if case_preflight_errors:
                 table_error_cases += 1
-            preserve_legacy_failure = bool(self.SelectedArteries) and all(
+            preserve_legacy_failure = bool(required_arteries) and all(
                 artery_outcomes[artery].get('legacy_failed_skip', False)
-                for artery in self.SelectedArteries
+                for artery in required_arteries
             )
             if preserve_legacy_failure:
                 record['filter_mask_complete'] = legacy_filter_complete
@@ -1603,7 +2657,7 @@ class BatchSliceRadiomics:
                 record['filter_mask_complete'] = int(
                     not case_preflight_errors and all(
                         artery_outcomes[artery]['complete']
-                        for artery in self.SelectedArteries
+                        for artery in required_arteries
                     )
                 )
                 record['filter_mask_er_msg'] = _clean_error_message(
@@ -1615,28 +2669,42 @@ class BatchSliceRadiomics:
                     record, 'filter_mask_complete'
                 ),
                 'skipped': bool(
-                    self.SelectedArteries and all(
+                    not required_arteries or all(
                         artery_outcomes[artery]['skipped']
-                        for artery in self.SelectedArteries
+                        for artery in required_arteries
                     )
                 ),
                 'failed_skipped': any(
                     artery_outcomes[artery].get('failed_skipped', False)
-                    for artery in self.SelectedArteries
+                    for artery in required_arteries
                 ),
                 'error_message': record['filter_mask_er_msg'],
                 'arteries': artery_outcomes,
             }
             self._save_xsection_record_map(record_map)
+            case_outcome = outcomes[str(case_path)]
+            if case_outcome['complete']:
+                case_state = (
+                    'skipped' if case_outcome['skipped'] else 'completed'
+                )
+            else:
+                case_state = 'failed'
+            self._emit_case_stage(
+                case_path,
+                'Filter Mask',
+                case_state,
+                case_outcome.get('error_message', ''),
+            )
 
         self.UpdateMsgLog(
             'Filter Mask resume summary: skipped complete {0}, skipped failed '
-            '{1}, completed {2}, incomplete {3} artery outputs; table-error '
-            'cases {4}.'.format(
+            '{1}, completed {2}, incomplete {3}, not applicable {4} artery '
+            'outputs; table-error cases {5}.'.format(
                 skipped_arteries,
                 skipped_failed_arteries,
                 completed_arteries,
                 incomplete_arteries,
+                not_applicable_arteries,
                 table_error_cases,
             )
         )
@@ -1701,6 +2769,8 @@ class BatchSliceRadiomics:
         )
 
     def _merge_xsection_records(self):
+        if not self._manifest_merge_enabled:
+            return None
         try:
             return merge_xsection_records(
                 self.ManifestPath,
@@ -1785,23 +2855,23 @@ class BatchSliceRadiomics:
         return 'pending'
 
     def _update_case_aggregates(self, record):
-        selected = list(self.SelectedArteries)
+        selected = self._record_applicable_arteries(record)
         record['complete_xsection_CTA'] = int(
-            bool(selected) and all(
+            all(
                 self._status_is_complete(
                     record, '{0}_xsection_CTA_complete'.format(artery)
                 ) for artery in selected
             )
         )
         record['complete_xsection_seg'] = int(
-            bool(selected) and all(
+            all(
                 self._status_is_complete(
                     record, '{0}_xsection_seg_complete'.format(artery)
                 ) for artery in selected
             )
         )
         record['complete_lumen_correction'] = int(
-            bool(selected) and all(
+            all(
                 self._status_is_complete(
                     record, '{0}_lumen_complete'.format(artery)
                 ) for artery in selected
@@ -1923,8 +2993,16 @@ class BatchSliceRadiomics:
                     case_row['outputCSVPath']
                 )
                 case_path = self._case_path_from_output(output_path)
+                applicability = self._case_artery_applicability(case_path)
+                if (
+                        applicability.reliable
+                        and artery not in applicability.applicable_arteries):
+                    continue
+                runtime_executable = str(
+                    self.CPREXEPath or batch_row.get('EXEPath', '')
+                ).strip()
                 arguments = [
-                    str(batch_row['EXEPath']),
+                    runtime_executable,
                     str(input_image_path),
                     str(centerline_path),
                     str(output_path),
@@ -1944,7 +3022,7 @@ class BatchSliceRadiomics:
                     _file_signature(centerline_path, hash_contents=True),
                     'exe-path:{0}'.format(
                         os.path.normcase(
-                            os.path.abspath(str(batch_row['EXEPath']))
+                            os.path.abspath(runtime_executable)
                         )
                     ),
                     *arguments[5:],
@@ -1960,10 +3038,13 @@ class BatchSliceRadiomics:
                             case_path.name, artery, artifact_type
                         )
                     )
-                try:
-                    workers = max(1, int(float(batch_row.get('cpus', 1))))
-                except (TypeError, ValueError):
-                    workers = 1
+                if self.InnerXsectionWorkers is not None:
+                    workers = max(1, int(self.InnerXsectionWorkers))
+                else:
+                    try:
+                        workers = max(1, int(float(batch_row.get('cpus', 1))))
+                    except (TypeError, ValueError):
+                        workers = 1
                 jobs[key] = {
                     'case_path': case_path,
                     'artery': artery,
@@ -2005,12 +3086,80 @@ class BatchSliceRadiomics:
             requested_types.add('seg')
         pending_jobs = []
         outcomes = {}
+        expected_keys_by_case = {}
+        not_applicable_outputs = 0
+
+        def emit_case_if_ready(case_path, force=False):
+            case_id = Path(case_path).name
+            expected_keys = expected_keys_by_case.get(case_id, ())
+            if not expected_keys:
+                self._emit_case_stage(
+                    case_path, 'Xsection', 'skipped',
+                    'No selected arteries are applicable for this case.',
+                )
+                return
+            if not force and any(key not in outcomes for key in expected_keys):
+                return
+            case_outcomes = [
+                outcomes.get(key, {
+                    'complete': False,
+                    'skipped': False,
+                    'error_message': 'Xsection result was not recorded.',
+                })
+                for key in expected_keys
+            ]
+            if all(outcome.get('complete') for outcome in case_outcomes):
+                state = (
+                    'skipped'
+                    if all(outcome.get('skipped') for outcome in case_outcomes)
+                    else 'completed'
+                )
+            else:
+                state = 'failed'
+            messages = []
+            for outcome in case_outcomes:
+                message = str(outcome.get('error_message', '')).strip()
+                if message and message not in messages:
+                    messages.append(message)
+            self._emit_case_stage(
+                case_path,
+                'Xsection',
+                state,
+                _clean_error_message('; '.join(messages)),
+            )
 
         for case_path_text in self.DCMDirList:
             case_path = Path(case_path_text)
             case_key = self._record_key(self.BatchName, case_path.name)
+            applicability = self._case_artery_applicability(case_path)
+            required_arteries = tuple(applicability.applicable_arteries)
+            not_applicable = (
+                tuple(
+                    artery for artery in self.SelectedArteries
+                    if artery not in required_arteries
+                )
+                if applicability.reliable else ()
+            )
+            expected_keys_by_case[case_path.name] = tuple(
+                (case_path.name, artery, artifact_type)
+                for artery in required_arteries
+                for artifact_type in ('CTA', 'seg')
+                if artifact_type in requested_types
+            )
             record = self._ensure_case_record(record_map, case_path)
             record['run_xsection'] = 1
+            for artery in not_applicable:
+                self._normalize_not_applicable_artery(
+                    record, case_path, artery, applicability
+                )
+                for artifact_type in requested_types:
+                    outcomes[(case_path.name, artery, artifact_type)] = {
+                        'complete': True,
+                        'skipped': True,
+                        'not_applicable': True,
+                        'error_message': '',
+                    }
+                    not_applicable_outputs += 1
             source_segmentation = (
                 case_path / 'Preproc' / 'OriData' /
                 'sc_labelled_coronary_segment.nii.gz'
@@ -2028,7 +3177,7 @@ class BatchSliceRadiomics:
                 and not self._status_is_complete(record, 'filter_mask_complete')
             )
 
-            for artery in self.SelectedArteries:
+            for artery in required_arteries:
                 for artifact_type in ('CTA', 'seg'):
                     failed_field, message_field, complete_field, fingerprint_field = (
                         self._xsection_fields(artery, artifact_type)
@@ -2056,6 +3205,7 @@ class BatchSliceRadiomics:
                             str(case_path.resolve()),
                             artery,
                             artifact_type,
+                            applicability.source_fingerprint,
                         ))
                         missing_job_state = self._resume_state(
                             record.get(complete_field, 0),
@@ -2087,6 +3237,10 @@ class BatchSliceRadiomics:
                                 artifact_type, artery
                             )
                         )
+                        if not applicability.reliable:
+                            error_message = _append_error(
+                                error_message, applicability.error_message
+                            )
                         if output_path.is_file() and not valid_output:
                             try:
                                 moved_path = self._move_failed_artifact(
@@ -2137,9 +3291,14 @@ class BatchSliceRadiomics:
                         }
                         continue
 
-                    dependency_error = ''
+                    dependency_error = (
+                        applicability.error_message
+                        if not applicability.reliable else ''
+                    )
                     if artifact_type == 'seg' and not valid_source:
-                        dependency_error = source_validation_error
+                        dependency_error = _append_error(
+                            dependency_error, source_validation_error
+                        )
                     artery_filter_complete, artery_filter_message, artery_filter_fingerprint = (
                         _filter_mask_status_fields(artery)
                     )
@@ -2152,7 +3311,9 @@ class BatchSliceRadiomics:
                             record, artery_filter_complete
                         )
                         if artery_filter_status_known
-                        else filter_incomplete
+                        # A verified per-case contract plus artifact preflight
+                        # is more precise than a stale legacy case aggregate.
+                        else (filter_incomplete and not applicability.reliable)
                     )
                     if artifact_type == 'seg' and artery_filter_incomplete:
                         filter_error = (
@@ -2263,6 +3424,7 @@ class BatchSliceRadiomics:
                     )
                     pending_jobs.append(job)
             self._update_case_aggregates(record)
+            emit_case_if_ready(case_path)
 
         # Publish pessimistic state before the first external process starts.
         self._save_xsection_record_map(record_map)
@@ -2350,14 +3512,21 @@ class BatchSliceRadiomics:
                     'error_message': error_message,
                 }
                 self._save_xsection_record_map(record_map)
+                emit_case_if_ready(job['case_path'])
 
+        for case_path_text in self.DCMDirList:
+            emit_case_if_ready(Path(case_path_text), force=True)
         for record in record_map.values():
             self._update_case_aggregates(record)
         self._save_xsection_record_map(record_map)
         self._merge_xsection_records()
         skipped_complete = sum(
             1 for outcome in outcomes.values()
-            if outcome.get('complete') and outcome.get('skipped')
+            if (
+                outcome.get('complete')
+                and outcome.get('skipped')
+                and not outcome.get('not_applicable')
+            )
         )
         skipped_failed = sum(
             1 for outcome in outcomes.values()
@@ -2369,11 +3538,12 @@ class BatchSliceRadiomics:
         )
         self.UpdateMsgLog(
             'Xsection resume summary: skipped complete {0}, skipped failed '
-            '{1}, submitted {2}, incomplete {3}.'.format(
+            '{1}, submitted {2}, incomplete {3}, not applicable {4}.'.format(
                 skipped_complete,
                 skipped_failed,
                 len(pending_jobs),
                 incomplete,
+                not_applicable_outputs,
             )
         )
         return outcomes
@@ -2407,6 +3577,11 @@ class BatchSliceRadiomics:
                 str(row.get('Output Directory', '')).strip()
             )
             case_path = self._case_path_from_output(output_directory)
+            applicability = self._case_artery_applicability(case_path)
+            if (
+                    applicability.reliable
+                    and artery not in applicability.applicable_arteries):
+                continue
             row_map[(
                 self._record_key(self.BatchName, case_path.name), artery
             )] = (case_path, row)
@@ -2414,10 +3589,31 @@ class BatchSliceRadiomics:
         record_map = self._load_xsection_record_map()
         outcomes = {}
         submitted_corrections = 0
+        not_applicable_outputs = 0
         for case_path_text in self.DCMDirList:
             case_path = Path(case_path_text)
             case_key = self._record_key(self.BatchName, case_path.name)
             record = self._ensure_case_record(record_map, case_path)
+            applicability = self._case_artery_applicability(case_path)
+            required_arteries = tuple(applicability.applicable_arteries)
+            not_applicable = (
+                tuple(
+                    artery for artery in self.SelectedArteries
+                    if artery not in required_arteries
+                )
+                if applicability.reliable else ()
+            )
+            for artery in not_applicable:
+                self._normalize_not_applicable_artery(
+                    record, case_path, artery, applicability
+                )
+                outcomes[(case_path.name, artery)] = {
+                    'complete': True,
+                    'skipped': True,
+                    'not_applicable': True,
+                    'error_message': '',
+                }
+                not_applicable_outputs += 1
             source_segmentation = (
                 case_path / 'Preproc' / 'OriData' /
                 'sc_labelled_coronary_segment.nii.gz'
@@ -2434,7 +3630,7 @@ class BatchSliceRadiomics:
                 filter_status_known
                 and not self._status_is_complete(record, 'filter_mask_complete')
             )
-            for artery in self.SelectedArteries:
+            for artery in required_arteries:
                 complete_field = '{0}_lumen_complete'.format(artery)
                 message_field = '{0}_lumen_er_msg'.format(artery)
                 fingerprint_field = '{0}_lumen_fingerprint'.format(artery)
@@ -2445,6 +3641,7 @@ class BatchSliceRadiomics:
                         'missing-row',
                         str(case_path.resolve()),
                         artery,
+                        applicability.source_fingerprint,
                     ))
                     missing_row_state = self._resume_state(
                         record.get(complete_field, 0),
@@ -2474,6 +3671,10 @@ class BatchSliceRadiomics:
                     record[message_field] = (
                         'No Lumen Correction table row for {0}'.format(artery)
                     )
+                    if not applicability.reliable:
+                        record[message_field] = _append_error(
+                            record[message_field], applicability.error_message
+                        )
                     outcomes[(case_path.name, artery)] = {
                         'complete': False,
                         'skipped': False,
@@ -2521,9 +3722,14 @@ class BatchSliceRadiomics:
                         'error_message': record.get(message_field, ''),
                     }
                     continue
-                dependency_error = ''
+                dependency_error = (
+                    applicability.error_message
+                    if not applicability.reliable else ''
+                )
                 if not source_valid:
-                    dependency_error = source_validation_error
+                    dependency_error = _append_error(
+                        dependency_error, source_validation_error
+                    )
                 artery_filter_complete, artery_filter_message, artery_filter_fingerprint = (
                     _filter_mask_status_fields(artery)
                 )
@@ -2534,7 +3740,7 @@ class BatchSliceRadiomics:
                 artery_filter_incomplete = (
                     not self._status_is_complete(record, artery_filter_complete)
                     if artery_filter_status_known
-                    else filter_incomplete
+                    else (filter_incomplete and not applicability.reliable)
                 )
                 if artery_filter_incomplete:
                     filter_error = (
@@ -2787,10 +3993,47 @@ class BatchSliceRadiomics:
             self._update_case_aggregates(record)
             self._save_xsection_record_map(record_map)
 
+            case_outcomes = [
+                outcomes.get((case_path.name, artery), {
+                    'complete': False,
+                    'skipped': False,
+                    'error_message': (
+                        'Lumen Correction result was not recorded for {0}.'
+                        .format(artery)
+                    ),
+                })
+                for artery in required_arteries
+            ]
+            if not case_outcomes:
+                case_state = 'skipped'
+            elif all(outcome.get('complete') for outcome in case_outcomes):
+                case_state = (
+                    'skipped'
+                    if all(outcome.get('skipped') for outcome in case_outcomes)
+                    else 'completed'
+                )
+            else:
+                case_state = 'failed'
+            case_messages = []
+            for outcome in case_outcomes:
+                message = str(outcome.get('error_message', '')).strip()
+                if message and message not in case_messages:
+                    case_messages.append(message)
+            self._emit_case_stage(
+                case_path,
+                'Lumen Correction',
+                case_state,
+                _clean_error_message('; '.join(case_messages)),
+            )
+
         self._merge_xsection_records()
         skipped_complete = sum(
             1 for outcome in outcomes.values()
-            if outcome.get('complete') and outcome.get('skipped')
+            if (
+                outcome.get('complete')
+                and outcome.get('skipped')
+                and not outcome.get('not_applicable')
+            )
         )
         skipped_failed = sum(
             1 for outcome in outcomes.values()
@@ -2802,11 +4045,13 @@ class BatchSliceRadiomics:
         )
         self.UpdateMsgLog(
             'Lumen Correction resume summary: skipped complete {0}, skipped '
-            'failed {1}, submitted {2}, incomplete {3}.'.format(
+            'failed {1}, submitted {2}, incomplete {3}, not applicable '
+            '{4}.'.format(
                 skipped_complete,
                 skipped_failed,
                 submitted_corrections,
                 incomplete,
+                not_applicable_outputs,
             )
         )
         return outcomes
@@ -2820,9 +4065,15 @@ class BatchSliceRadiomics:
 
     @staticmethod
     def _default_lumen_process_path():
+        application_root = Path(
+            getattr(
+                sys,
+                '_MEIPASS',
+                Path(__file__).resolve().parents[3],
+            )
+        )
         return str(
-            Path(__file__).resolve().parents[3] /
-            'Base' / 'Tables' / 'LC' / 'LCProcess.csv'
+            application_root / 'Base' / 'Tables' / 'LC' / 'LCProcess.csv'
         )
 
     def _configure_from_ui(self):
@@ -2855,23 +4106,153 @@ class BatchSliceRadiomics:
         failed_root_text = _widget_text(
             getattr(self.ui, 'FailedRootPath_Txt_BSRJZ', None)
         )
-        self.ManifestPath = str(
-            Path(manifest_text) if manifest_text else
-            working_path.parent / DEFAULT_MANIFEST_FILE_NAME
+        self.ManifestPath = derive_nearby_manifest(
+            working_path, manifest_text
         )
-        self.FailedRootPath = str(
-            Path(failed_root_text) if failed_root_text else working_path.parent
+        self.FailedRootPath = derive_failed_root(
+            working_path, failed_root_text
         )
         self.TableDir = str(working_path / 'Table')
         Path(self.TableDir).mkdir(parents=True, exist_ok=True)
+        self.ResampleDepth = _widget_text(
+            getattr(self.ui, 'resampleDepthLineTxt_BSRJZ', None)
+        ) or '0.1'
+        self.InnerXsectionWorkers = 1
+        self.IgnoreCoordinates = _widget_text(
+            getattr(self.ui, 'ignoreCheck_Txt_BSRJZ', None)
+        )
+        self.CopyFileReferences = tuple(Preprocess_Mask.StrToLst(
+            _widget_text(getattr(self.ui, 'fileRefs_Txt_BSRJZ', None))
+        )['listOut'])
+        self.CopyNumberLimit = _widget_integer(
+            getattr(self.ui, 'numberLimit_Txt_BSRJZ', None), 20
+        )
         self.StoreListInformation()
 
-    def mainFunction(self):
+    def _run_config_from_ui(self):
+        if self.ui is None:
+            raise RuntimeError('Batch Slice Radiomics UI is unavailable')
         self.initProcess()
         self.CheckCheckBoxStatus()
         if not self.SelectedArteries:
             raise ValueError('Select at least one artery before running the batch')
-        self._configure_from_ui()
+        root_text = _widget_text(
+            getattr(self.ui, 'LoadFolderPath_Txt_BSRJZ', None)
+        )
+        if not root_text:
+            raise ValueError('Working directory is required')
+        root_path = Path(root_text)
+        if not root_path.is_dir():
+            raise NotADirectoryError(
+                'Working directory does not exist: {0}'.format(root_path)
+            )
+        manifest_path = derive_nearby_manifest(
+            root_path,
+            _widget_text(getattr(self.ui, 'ManifestPath_Txt_BSRJZ', None)),
+        )
+        failed_root_path = derive_failed_root(
+            root_path,
+            _widget_text(getattr(self.ui, 'FailedRootPath_Txt_BSRJZ', None)),
+        )
+        manifest_widget = getattr(self.ui, 'ManifestPath_Txt_BSRJZ', None)
+        failed_widget = getattr(self.ui, 'FailedRootPath_Txt_BSRJZ', None)
+        if manifest_widget is not None and hasattr(manifest_widget, 'setPlainText'):
+            manifest_widget.setPlainText(manifest_path)
+        if failed_widget is not None and hasattr(failed_widget, 'setPlainText'):
+            failed_widget.setPlainText(failed_root_path)
+        lumen_path = _widget_text(
+            getattr(self.ui, 'LumenCorrectionPath_Txt_BSRJZ', None)
+        ) or self._default_lumen_process_path()
+        file_references = tuple(Preprocess_Mask.StrToLst(
+            _widget_text(getattr(self.ui, 'fileRefs_Txt_BSRJZ', None))
+        )['listOut'])
+        return BatchSliceRunConfig(
+            root_path=str(root_path),
+            manifest_path=manifest_path,
+            failed_root_path=failed_root_path,
+            cpr_exe_path=_widget_text(
+                getattr(self.ui, 'CPRExePath_Txt_BSRJZ', None)
+            ),
+            lumen_process_path=lumen_path,
+            max_workers=_widget_integer(
+                getattr(self.ui, 'cpusLineTxt_BSRJZ', None),
+                DEFAULT_PARALLEL_WORKERS,
+            ),
+            copy_files=self.CopyFileFlag,
+            copy_origin_dir=_widget_text(
+                getattr(self.ui, 'CopyOriginFolderPath_Txt_BSRJZ', None)
+            ),
+            file_references=file_references,
+            copy_number_limit=_widget_integer(
+                getattr(self.ui, 'numberLimit_Txt_BSRJZ', None), 20
+            ),
+            scan_dicom=self.ScanFileFlag,
+            create_folders=self.CreateFolderFlag,
+            branch_dictionary=self.BranchDictFlag,
+            generate_tables=self.GenerateTFlag,
+            filter_mask=self.FMFlag,
+            xsection=self.XsecFlag,
+            lumen_correction=self.LCFlag,
+            mask_xsection=self.MaskXsectionFlag,
+            mask_xsection_only=self.MaskXsectionOnlyFlag,
+            rerun_failed=self.RerunFailedFlag,
+            selected_arteries=tuple(self.SelectedArteries),
+            xsection_timeout_seconds=self.XsectionTimeoutSeconds,
+            resample_depth=_widget_text(
+                getattr(self.ui, 'resampleDepthLineTxt_BSRJZ', None)
+            ) or '0.1',
+            cpr_angle='0',
+            ignore_coordinates=_widget_text(
+                getattr(self.ui, 'ignoreCheck_Txt_BSRJZ', None)
+            ),
+        )
+
+    def _apply_run_config(self, config, work_unit, progress_callback=None):
+        self.WorkingDir = str(work_unit.working_dir)
+        self.CopyOriginDir = str(config.copy_origin_dir)
+        self.CPREXEPath = str(config.cpr_exe_path)
+        self.LumenProcessSourcePath = str(config.lumen_process_path)
+        self.ManifestPath = str(config.manifest_path)
+        self.FailedRootPath = str(config.failed_root_path)
+        self.BatchName = str(work_unit.batch_name)
+        self.TableDir = str(work_unit.table_dir)
+        self.WorkUnitID = str(work_unit.unit_id)
+        self.WorkUnitRecordPath = str(work_unit.record_path)
+        self.DCMDirList = list(work_unit.case_paths)
+        self.CopyFileFlag = False
+        self.ScanFileFlag = bool(config.scan_dicom)
+        self.CreateFolderFlag = bool(config.create_folders)
+        self.BranchDictFlag = bool(config.branch_dictionary)
+        self.GenerateTFlag = bool(config.generate_tables)
+        self.FMFlag = bool(config.filter_mask)
+        self.XsecFlag = bool(config.xsection)
+        self.LCFlag = bool(config.lumen_correction)
+        self.MaskXsectionFlag = bool(config.mask_xsection)
+        self.MaskXsectionOnlyFlag = bool(config.mask_xsection_only)
+        self.RerunFailedFlag = bool(config.rerun_failed)
+        self.SelectedArteries = list(config.selected_arteries)
+        self.XsectionTimeoutSeconds = max(
+            1, int(config.xsection_timeout_seconds)
+        )
+        self.ResampleDepth = str(config.resample_depth or '0.1')
+        self.CPRAngle = str(config.cpr_angle or '0')
+        self.IgnoreCoordinates = str(config.ignore_coordinates or '')
+        self.CopyFileReferences = tuple(config.file_references)
+        self.CopyNumberLimit = max(1, int(config.copy_number_limit))
+        self.InnerXsectionWorkers = 1
+        self._manifest_merge_enabled = False
+        self._progress_callback = progress_callback
+        Path(self.TableDir).mkdir(parents=True, exist_ok=True)
+        self.StoreListInformation()
+        if (
+                work_unit.layout == 'direct_cases'
+                and not config.generate_tables):
+            self._stage_existing_case_tables(
+                Path(work_unit.working_dir) / 'Table',
+                Path(work_unit.case_paths[0]),
+            )
+
+    def _run_work_unit(self, explicit_case_paths=None):
         self.UpdateMsgLog(
             'Resume policy: completed work is validated and skipped; unchanged '
             'failed work will {0}.'.format(
@@ -2888,21 +4269,20 @@ class BatchSliceRadiomics:
                 Save_Load_File.BatchCopyFiles(
                     fromFolder=self.CopyOriginDir,
                     toFolder=self.WorkingDir,
-                    fileRefs=Preprocess_Mask.StrToLst(
-                        _widget_text(getattr(self.ui, 'fileRefs_Txt_BSRJZ', None))
-                    )["listOut"],
-                    numberLimit=_widget_integer(
-                        getattr(self.ui, 'numberLimit_Txt_BSRJZ', None), 20
-                    ),
+                    fileRefs=list(self.CopyFileReferences),
+                    numberLimit=self.CopyNumberLimit,
                 )
                 self.UpdateMsgLog('Copy Files Done')
 
-            if self.ScanFileFlag:
-                self.UpdateMsgLog('Scan DCM folders start')
-                self.ScanDCMDir()
+            if explicit_case_paths is not None:
+                self.DCMDirList = [str(path) for path in explicit_case_paths]
             else:
-                self.UpdateMsgLog('Scan CTA folders start')
-                self.ScanCTADir()
+                if self.ScanFileFlag:
+                    self.UpdateMsgLog('Scan DCM folders start')
+                    self.ScanDCMDir()
+                else:
+                    self.UpdateMsgLog('Scan CTA folders start')
+                    self.ScanCTADir()
             self.UpdateMsgLog(
                 'Found {0} case folders'.format(len(self.DCMDirList))
             )
@@ -2935,12 +4315,9 @@ class BatchSliceRadiomics:
             if self.GenerateTFlag:
                 self.UpdateMsgLog('Generate tables start')
                 self.GenerateTable(
-                    resampleDepth=_widget_text(
-                        getattr(self.ui, 'resampleDepthLineTxt_BSRJZ', None)
-                    ) or '0.1',
-                    cpus=_widget_text(
-                        getattr(self.ui, 'cpusLineTxt_BSRJZ', None)
-                    ) or '2',
+                    resampleDepth=self.ResampleDepth,
+                    cpus='1',
+                    CPRAngle=self.CPRAngle,
                     maskXsection=self.MaskXsectionFlag,
                     maskXsectionOnly=self.MaskXsectionOnlyFlag,
                 )
@@ -2974,8 +4351,12 @@ class BatchSliceRadiomics:
                 self.UpdateMsgLog('Lumen Correction done')
 
             self._merge_xsection_records()
+        result_counts = self._case_result_counts()
         summary = {
             'case_count': len(self.DCMDirList),
+            'completed_cases': result_counts['completed'],
+            'skipped_cases': result_counts['skipped'],
+            'failed_cases': result_counts['failed'],
             'record_path': self.XsectionRecordPath,
             'manifest_path': self.ManifestPath,
             'failed_root': str(
@@ -2990,6 +4371,184 @@ class BatchSliceRadiomics:
         )
         return summary
 
+    def mainFunction(
+            self,
+            run_config=None,
+            work_unit=None,
+            progress_callback=None):
+        if run_config is not None:
+            if work_unit is None:
+                raise ValueError('A work unit is required with a run config')
+            self.initProcess()
+            if not run_config.selected_arteries:
+                raise ValueError(
+                    'Select at least one artery before running the batch'
+                )
+            self._apply_run_config(
+                run_config, work_unit, progress_callback=progress_callback
+            )
+            return self._run_work_unit(
+                explicit_case_paths=work_unit.case_paths
+            )
+
+        config = self._run_config_from_ui()
+        return run_parallel_batch_slice(config)
+
+    @Slot()
+    def startParallelRun(self):
+        if self._run_thread is not None and self._run_thread.isRunning():
+            return
+        try:
+            config = self._run_config_from_ui()
+        except Exception as error:
+            self._on_parallel_failed(str(error))
+            return
+
+        if config.max_workers > DEFAULT_PARALLEL_WORKERS:
+            answer = QMessageBox.question(
+                self.ui,
+                'Confirm high-load run',
+                'You requested {0} worker processes. This machine has shown '
+                'hardware-level WHEA errors under load. Update the BIOS, use '
+                'Intel Default Settings, and validate stability before a '
+                '24/32-worker production run. Continue with up to {0} workers?'
+                .format(config.max_workers),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                self._set_progress_status('Run cancelled before processing.', 0)
+                return
+
+        self._set_run_button_enabled(False)
+        self._set_progress_status('Discovering cases...', 0)
+        thread = QThread()
+        coordinator = BatchSliceCoordinator(config)
+        coordinator.moveToThread(thread)
+        thread.started.connect(coordinator.run)
+        coordinator.progress.connect(self._on_parallel_progress)
+        coordinator.log.connect(self._on_parallel_log)
+        coordinator.finished.connect(self._on_parallel_finished)
+        coordinator.failed.connect(self._on_parallel_failed)
+        coordinator.finished.connect(coordinator.deleteLater)
+        coordinator.failed.connect(coordinator.deleteLater)
+        coordinator.finished.connect(thread.quit)
+        coordinator.failed.connect(thread.quit)
+        thread.finished.connect(self._on_parallel_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._run_thread = thread
+        self._run_coordinator = coordinator
+        thread.start()
+
+    def _set_run_button_enabled(self, enabled):
+        if self.ui is None:
+            return
+        button = getattr(self.ui, 'RunBtn_CPP', None)
+        if button is not None:
+            button.setEnabled(bool(enabled))
+
+    def _set_progress_status(self, text, percent=None):
+        if self.ui is None:
+            return
+        label = getattr(self.ui, 'BatchProgress_Label_BSRJZ', None)
+        progress_bar = getattr(self.ui, 'BatchProgress_PB_BSRJZ', None)
+        if label is not None:
+            label.setText(str(text))
+        if progress_bar is not None and percent is not None:
+            progress_bar.setValue(max(0, min(100, int(percent))))
+
+    @staticmethod
+    def _format_duration(seconds):
+        seconds = max(0, int(round(float(seconds or 0))))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return '{0:d}h {1:02d}m'.format(hours, minutes)
+        if minutes:
+            return '{0:d}m {1:02d}s'.format(minutes, seconds)
+        return '{0:d}s'.format(seconds)
+
+    @Slot(object)
+    def _on_parallel_progress(self, snapshot):
+        if not isinstance(snapshot, BatchSliceProgressSnapshot):
+            return
+        stage_text = ', '.join(
+            '{0} {1}/{2}/{3}'.format(stage, completed, skipped, failed)
+            for stage, completed, skipped, failed in snapshot.stage_counts
+        )
+        finalized_cases = (
+            snapshot.completed_cases
+            + snapshot.skipped_cases
+            + snapshot.failed_cases
+        )
+        status = (
+            'cases {0}/{1}: completed {2}, skipped {3}, failed {4} | '
+            'stage-cases {5}/{6} | active {7} | elapsed {8} | ETA {9}'
+        ).format(
+            finalized_cases,
+            snapshot.total_cases,
+            snapshot.completed_cases,
+            snapshot.skipped_cases,
+            snapshot.failed_cases,
+            snapshot.done_steps,
+            snapshot.total_steps,
+            snapshot.active_workers,
+            self._format_duration(snapshot.elapsed_seconds),
+            self._format_duration(snapshot.eta_seconds),
+        )
+        if stage_text:
+            status += ' | ' + stage_text
+        self._set_progress_status(status, snapshot.percent)
+
+    @Slot(str)
+    def _on_parallel_log(self, message):
+        self.UpdateMsgLog(message)
+
+    @Slot(object)
+    def _on_parallel_finished(self, result):
+        self._last_run_result = result
+        completed_cases = sum(
+            work_result.completed_cases
+            for work_result in result.work_results
+        )
+        skipped_cases = sum(
+            work_result.skipped_cases
+            for work_result in result.work_results
+        )
+        failed_cases = sum(
+            work_result.failed_cases
+            for work_result in result.work_results
+        )
+        self._set_progress_status(
+            'Finished {0} cases: completed {1}, skipped {2}, failed {3}; '
+            '{4} workers; {5}.'.format(
+                result.discovery.discovered_count,
+                completed_cases,
+                skipped_cases,
+                failed_cases,
+                result.worker_count,
+                self._format_duration(result.duration_seconds),
+            ),
+            100,
+        )
+        self.UpdateMsgLog(
+            'Hybrid Batch Slice Radiomics finished. Manifest: {0}; run log: '
+            '{1}'.format(result.manifest_path, result.log_path)
+        )
+
+    @Slot(str)
+    def _on_parallel_failed(self, message):
+        self._set_progress_status('Run stopped: {0}'.format(message))
+        self.UpdateMsgLog('Batch Slice Radiomics stopped: {0}'.format(message))
+        if self._run_thread is None:
+            self._set_run_button_enabled(True)
+
+    @Slot()
+    def _on_parallel_thread_finished(self):
+        self._set_run_button_enabled(True)
+        self._run_coordinator = None
+        self._run_thread = None
+
     def UpdateMsgLog(self, msg=""):
         # Date and time
         nowStr = datetime.now().strftime("%d/%b/%y - %H:%M:%S")
@@ -2999,11 +4558,576 @@ class BatchSliceRadiomics:
                + msg \
                + "\n############################\n"
 
+        self._emit_progress('log', message=msg)
         if self.modelui:
             # update log and display message
             self.modelui.plainTextEdit_Message.setPlainText(disp)
             self.modelui.plainTextEdit_Log.appendPlainText(disp)
-        print(disp)
+        if self._progress_callback is None or self.ui is not None:
+            print(disp, flush=True)
+
+
+_WORKER_PROGRESS_QUEUE = None
+_WORKER_THREAD_ENVIRONMENT = (
+    'OMP_NUM_THREADS',
+    'MKL_NUM_THREADS',
+    'OPENBLAS_NUM_THREADS',
+    'NUMEXPR_NUM_THREADS',
+    'VECLIB_MAXIMUM_THREADS',
+    'ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS',
+)
+
+
+def _initialize_batch_slice_worker(progress_queue=None):
+    """Initialize one spawned process before importing headless processors."""
+
+    global _WORKER_PROGRESS_QUEUE
+    _WORKER_PROGRESS_QUEUE = progress_queue
+    if multiprocessing.current_process().name != 'MainProcess':
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except (AttributeError, ValueError):
+            pass
+    for variable_name in _WORKER_THREAD_ENVIRONMENT:
+        os.environ[variable_name] = '1'
+    try:
+        sitk.ProcessObject.SetGlobalDefaultNumberOfThreads(1)
+    except Exception:
+        pass
+
+
+@contextmanager
+def _single_thread_worker_environment():
+    previous_values = {
+        variable_name: os.environ.get(variable_name)
+        for variable_name in _WORKER_THREAD_ENVIRONMENT
+    }
+    try:
+        for variable_name in _WORKER_THREAD_ENVIRONMENT:
+            os.environ[variable_name] = '1'
+        yield
+    finally:
+        for variable_name, previous_value in previous_values.items():
+            if previous_value is None:
+                os.environ.pop(variable_name, None)
+            else:
+                os.environ[variable_name] = previous_value
+
+
+def _put_worker_progress(event, progress_queue=None):
+    target_queue = progress_queue or _WORKER_PROGRESS_QUEUE
+    if target_queue is None:
+        return
+    try:
+        target_queue.put(event)
+    except Exception:
+        pass
+
+
+def run_batch_slice_work_unit(config, work_unit, progress_queue=None):
+    """Spawn-safe headless entry point for exactly one work unit."""
+
+    _initialize_batch_slice_worker(progress_queue or _WORKER_PROGRESS_QUEUE)
+    started_at = time.monotonic()
+    _put_worker_progress(BatchSliceProgress(
+        kind='unit_started',
+        unit_id=work_unit.unit_id,
+        batch_name=work_unit.batch_name,
+        message='Started {0}'.format(work_unit.unit_id),
+        timestamp=time.time(),
+        process_id=os.getpid(),
+    ), progress_queue)
+    output_buffer = _BoundedTextBuffer()
+    summary = None
+    error_message = ''
+    with redirect_stdout(output_buffer), redirect_stderr(output_buffer):
+        try:
+            if work_unit.layout == 'direct_cases':
+                _seed_pending_ledger(
+                    work_unit.canonical_record_path,
+                    work_unit.record_path,
+                    work_unit.batch_name,
+                    work_unit.case_ids[0],
+                )
+            from Modules_JZ.FilterMask import FilterMaskMain
+            from Modules_JZ.LumenCorrect import LumenCorrectMain
+
+            filter_processor = FilterMaskMain.FilterMask(UI=None, Hedys=None)
+            lumen_processor = LumenCorrectMain.LumCorrect(UI=None, Hedys=None)
+            controller = BatchSliceRadiomics(
+                UI=None,
+                Hedys=None,
+                filter_mask_runner=filter_processor.BatchProcessing,
+                lumen_runner=lumen_processor.BatchCorrect,
+            )
+            summary = controller.mainFunction(
+                run_config=config,
+                work_unit=work_unit,
+                progress_callback=lambda event: _put_worker_progress(
+                    event, progress_queue
+                ),
+            )
+        except BaseException as error:
+            error_message = _clean_error_message(
+                '{0}: {1}\n{2}'.format(
+                    type(error).__name__,
+                    error,
+                    traceback.format_exc(),
+                ),
+                WORKER_OUTPUT_TAIL_LENGTH,
+            )
+
+    if summary is None:
+        completed_cases = 0
+        skipped_cases = 0
+        failed_cases = work_unit.case_count
+    else:
+        completed_cases = int(summary.get('completed_cases', 0))
+        skipped_cases = int(summary.get('skipped_cases', 0))
+        failed_cases = int(summary.get('failed_cases', 0))
+    result = BatchSliceWorkResult(
+        unit_id=work_unit.unit_id,
+        layout=work_unit.layout,
+        batch_name=work_unit.batch_name,
+        case_count=work_unit.case_count,
+        completed_cases=completed_cases,
+        skipped_cases=skipped_cases,
+        failed_cases=failed_cases,
+        record_path=work_unit.record_path,
+        duration_seconds=round(time.monotonic() - started_at, 3),
+        error_message=error_message,
+        output_tail=(output_buffer.tail() if error_message else ''),
+    )
+    _put_worker_progress(BatchSliceProgress(
+        kind=('unit_failed' if error_message else 'unit_finished'),
+        unit_id=work_unit.unit_id,
+        batch_name=work_unit.batch_name,
+        state=('failed' if error_message else 'completed'),
+        message=(
+            error_message
+            or 'Finished {0} ({1} cases)'.format(
+                work_unit.unit_id, work_unit.case_count
+            )
+        ),
+        timestamp=time.time(),
+        process_id=os.getpid(),
+    ), progress_queue)
+    return result
+
+
+class _ConciseRunLog:
+    def __init__(self, log_path):
+        self.path = Path(log_path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.path.open('a', encoding='utf-8', buffering=1)
+
+    def write(self, message):
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self._file.write('[{0}] {1}\n'.format(timestamp, str(message).strip()))
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+
+
+def run_parallel_batch_slice(config, progress_callback=None, log_callback=None):
+    """Coordinate hybrid batch/case process workers without accessing Qt."""
+
+    started_at = time.monotonic()
+    root_path = Path(config.root_path)
+    record_root = root_path / 'Table' / XSECTION_RECORD_FOLDER
+    record_root.mkdir(parents=True, exist_ok=True)
+    run_stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+    log_path = record_root / (
+        'BatchSliceRadiomics_{0}_{1}.log'.format(run_stamp, os.getpid())
+    )
+    run_log = _ConciseRunLog(log_path)
+    run_lock_path = record_root / 'hybrid_batch_run.lock'
+    results = []
+
+    def emit_log(message):
+        message = str(message).strip()
+        if not message:
+            return
+        run_log.write(message)
+        if log_callback is not None:
+            log_callback(message)
+        else:
+            print(message, flush=True)
+
+    try:
+        with interprocess_file_lock(run_lock_path):
+            if config.copy_files:
+                emit_log('Copy Files start for selected root.')
+                Save_Load_File.BatchCopyFiles(
+                    fromFolder=config.copy_origin_dir,
+                    toFolder=config.root_path,
+                    fileRefs=list(config.file_references),
+                    numberLimit=config.copy_number_limit,
+                )
+                emit_log('Copy Files finished.')
+
+            discovery = discover_batch_slice_work(config)
+            if not discovery.work_units:
+                raise ValueError(
+                    'No compatible case folders were found under {0}.'.format(
+                        config.root_path
+                    )
+                )
+            worker_count = clamp_parallel_workers(
+                config.max_workers, len(discovery.work_units)
+            )
+            emit_log(
+                'Discovery: layout {0}; cases {1}; work units {2}; excluded '
+                '{3}; manifest-only {4}; out-of-scope manifest rows {5}; '
+                'workers {6}.'.format(
+                    discovery.layout,
+                    discovery.discovered_count,
+                    len(discovery.work_units),
+                    discovery.excluded_count,
+                    discovery.manifest_only_count,
+                    discovery.out_of_scope_count,
+                    worker_count,
+                )
+            )
+            if config.max_workers > DEFAULT_PARALLEL_WORKERS:
+                emit_log(
+                    'High-load warning: requested {0} workers; outer workers '
+                    'were clamped to {1} and every inner CPR/thread setting '
+                    'was fixed at one.'.format(
+                        config.max_workers, worker_count
+                    )
+                )
+
+            canonical_path = None
+            if discovery.layout == 'direct_cases':
+                canonical_path = discovery.work_units[0].canonical_record_path
+                recovered = compact_pending_ledgers(
+                    canonical_path,
+                    manifest_path=config.manifest_path,
+                )
+                if recovered['pending_file_count']:
+                    emit_log(
+                        'Recovered {0} pending ledgers ({1} rows) before '
+                        'scheduling.'.format(
+                            recovered['pending_file_count'],
+                            recovered['record_count'],
+                        )
+                    )
+                for compact_error in recovered['errors']:
+                    emit_log('Pending-ledger recovery warning: ' + compact_error)
+
+            tracker = BatchSliceProgressTracker(
+                discovery, config.enabled_stages, started_at=started_at
+            )
+            if progress_callback is not None:
+                progress_callback(tracker.snapshot())
+            last_summary_at = time.monotonic()
+            last_heartbeat_at = time.monotonic()
+            processed_case_units = 0
+            completed_pending_paths = []
+
+            def publish_snapshot(snapshot=None, force_gui=False):
+                nonlocal last_summary_at, last_heartbeat_at
+                snapshot = snapshot or tracker.snapshot()
+                now = time.monotonic()
+                if (
+                        progress_callback is not None
+                        and (
+                            force_gui
+                            or now - last_heartbeat_at >= 1.0
+                        )):
+                    progress_callback(snapshot)
+                    last_heartbeat_at = now
+                if now - last_summary_at >= LOG_SUMMARY_INTERVAL_SECONDS:
+                    emit_log(
+                        'Progress: {0}/{1} stage-cases; completed {2}, '
+                        'skipped {3}, failed {4}; active workers {5}; ETA '
+                        '{6:.0f}s.'.format(
+                            snapshot.done_steps,
+                            snapshot.total_steps,
+                            snapshot.completed_cases,
+                            snapshot.skipped_cases,
+                            snapshot.failed_cases,
+                            snapshot.active_workers,
+                            snapshot.eta_seconds,
+                        )
+                    )
+                    last_summary_at = now
+                return snapshot
+
+            def publish_event(event):
+                if not isinstance(event, BatchSliceProgress):
+                    return
+                if event.kind == 'log':
+                    emit_log(
+                        '[{0}] {1}'.format(event.unit_id, event.message)
+                    )
+                    return
+                snapshot = tracker.consume(event)
+                publish_snapshot(snapshot, force_gui=True)
+                if event.kind == 'case_stage' and event.state == 'failed':
+                    emit_log(
+                        'FAILED {0}/{1} {2}: {3}'.format(
+                            event.batch_name,
+                            event.case_id,
+                            event.stage,
+                            event.message or 'no error message',
+                        )
+                    )
+                elif event.kind in ('unit_started', 'unit_finished', 'unit_failed'):
+                    emit_log(event.message)
+
+            def handle_result(work_unit, result):
+                nonlocal processed_case_units
+                results.append(result)
+                if result.error_message:
+                    emit_log(
+                        'Worker failed for {0}: {1}'.format(
+                            work_unit.unit_id, result.error_message
+                        )
+                    )
+                    if result.output_tail:
+                        emit_log(
+                            'Bounded worker output tail for {0}: {1}'.format(
+                                work_unit.unit_id,
+                                _clean_error_message(
+                                    result.output_tail,
+                                    WORKER_OUTPUT_TAIL_LENGTH,
+                                ),
+                            )
+                        )
+                    snapshot = tracker.fail_unit(work_unit)
+                    publish_snapshot(snapshot, force_gui=True)
+                if discovery.layout == 'nested_batches':
+                    if Path(result.record_path).is_file():
+                        merge_xsection_records(
+                            config.manifest_path, result.record_path
+                        )
+                else:
+                    processed_case_units += work_unit.case_count
+                    completed_pending_paths.append(result.record_path)
+                    if (
+                            processed_case_units % PENDING_COMPACT_INTERVAL == 0
+                            and canonical_path):
+                        compacted = compact_pending_ledgers(
+                            canonical_path,
+                            pending_paths=tuple(completed_pending_paths),
+                        )
+                        completed_pending_paths[:] = []
+                        for compact_error in compacted['errors']:
+                            emit_log(
+                                'Pending-ledger compact warning: '
+                                + compact_error
+                            )
+                    if (
+                            processed_case_units % MANIFEST_MERGE_INTERVAL == 0
+                            and canonical_path
+                            and Path(canonical_path).is_file()):
+                        if completed_pending_paths:
+                            compact_pending_ledgers(
+                                canonical_path,
+                                pending_paths=tuple(completed_pending_paths),
+                            )
+                            completed_pending_paths[:] = []
+                        merge_xsection_records(
+                            config.manifest_path, canonical_path
+                        )
+
+            context = multiprocessing.get_context('spawn')
+            progress_queue = context.Queue()
+            future_units = {}
+            unit_iterator = iter(discovery.work_units)
+            pool_broken_error = None
+
+            def drain_progress_queue(wait_for_one=False):
+                first = True
+                while True:
+                    try:
+                        timeout = 0.1 if wait_for_one and first else 0
+                        event = progress_queue.get(
+                            timeout=timeout
+                        ) if timeout else progress_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    except (EOFError, OSError):
+                        break
+                    first = False
+                    publish_event(event)
+
+            with _single_thread_worker_environment():
+                with ProcessPoolExecutor(
+                        max_workers=worker_count,
+                        mp_context=context,
+                        initializer=_initialize_batch_slice_worker,
+                        initargs=(progress_queue,)) as executor:
+
+                    def submit_next_unit():
+                        try:
+                            unit = next(unit_iterator)
+                        except StopIteration:
+                            return False
+                        future = executor.submit(
+                            run_batch_slice_work_unit, config, unit
+                        )
+                        future_units[future] = unit
+                        publish_event(BatchSliceProgress(
+                            kind='unit_submitted',
+                            unit_id=unit.unit_id,
+                            batch_name=unit.batch_name,
+                            timestamp=time.time(),
+                        ))
+                        return True
+
+                    for _ in range(worker_count):
+                        if not submit_next_unit():
+                            break
+
+                    while future_units:
+                        done, _ = wait(
+                            tuple(future_units),
+                            timeout=0.25,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        drain_progress_queue()
+                        publish_snapshot()
+                        if not done:
+                            continue
+                        for future in done:
+                            unit = future_units.pop(future)
+                            try:
+                                result = future.result()
+                            except Exception as error:
+                                error_text = _clean_error_message(
+                                    'Process worker crashed: {0}'.format(error)
+                                )
+                                result = BatchSliceWorkResult(
+                                    unit_id=unit.unit_id,
+                                    layout=unit.layout,
+                                    batch_name=unit.batch_name,
+                                    case_count=unit.case_count,
+                                    completed_cases=0,
+                                    skipped_cases=0,
+                                    failed_cases=unit.case_count,
+                                    record_path=unit.record_path,
+                                    duration_seconds=0.0,
+                                    error_message=error_text,
+                                )
+                                if isinstance(error, BrokenProcessPool):
+                                    pool_broken_error = error_text
+                            handle_result(unit, result)
+                            publish_event(BatchSliceProgress(
+                                kind=(
+                                    'unit_failed'
+                                    if result.error_message
+                                    else 'unit_finished'
+                                ),
+                                unit_id=unit.unit_id,
+                                batch_name=unit.batch_name,
+                                message='',
+                                timestamp=time.time(),
+                            ))
+                            if pool_broken_error is None:
+                                try:
+                                    submit_next_unit()
+                                except Exception as submit_error:
+                                    pool_broken_error = _clean_error_message(
+                                        'Could not schedule another work unit: '
+                                        '{0}'.format(submit_error)
+                                    )
+                        if pool_broken_error:
+                            break
+
+            drain_progress_queue(wait_for_one=True)
+            try:
+                progress_queue.close()
+                progress_queue.join_thread()
+            except Exception:
+                pass
+
+            if discovery.layout == 'direct_cases' and canonical_path:
+                compacted = compact_pending_ledgers(
+                    canonical_path,
+                    manifest_path=config.manifest_path,
+                )
+                for compact_error in compacted['errors']:
+                    emit_log('Final pending-ledger warning: ' + compact_error)
+            elif pool_broken_error:
+                # A native crash can invalidate every future in the pool.
+                # Reconcile any batch checkpoints that reached disk before
+                # surfacing the failure; untouched units remain untouched.
+                for unit in discovery.work_units:
+                    if Path(unit.record_path).is_file():
+                        merge_xsection_records(
+                            config.manifest_path, unit.record_path
+                        )
+
+            final_snapshot = tracker.snapshot()
+            if progress_callback is not None:
+                progress_callback(final_snapshot)
+            emit_log(
+                'Final progress: {0}/{1} stage-cases; completed {2}, skipped '
+                '{3}, failed {4}.'.format(
+                    final_snapshot.done_steps,
+                    final_snapshot.total_steps,
+                    final_snapshot.completed_cases,
+                    final_snapshot.skipped_cases,
+                    final_snapshot.failed_cases,
+                )
+            )
+            if pool_broken_error:
+                raise RuntimeError(
+                    pool_broken_error
+                    + ' Persisted interruption markers were retained; rerun '
+                    'to resume. Unstarted units were not modified.'
+                )
+
+        return BatchSliceRunResult(
+            discovery=discovery,
+            work_results=tuple(results),
+            worker_count=worker_count,
+            manifest_path=str(config.manifest_path),
+            log_path=str(log_path),
+            duration_seconds=round(time.monotonic() - started_at, 3),
+        )
+    except BaseException as error:
+        run_log.write(
+            'RUN FAILED: {0}: {1}'.format(type(error).__name__, error)
+        )
+        raise
+    finally:
+        run_log.close()
+
+
+class BatchSliceCoordinator(QObject):
+    """Qt worker object; all UI work remains in the owning GUI thread."""
+
+    progress = Signal(object)
+    log = Signal(str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+
+    @Slot()
+    def run(self):
+        try:
+            result = run_parallel_batch_slice(
+                self.config,
+                progress_callback=self.progress.emit,
+                log_callback=self.log.emit,
+            )
+        except Exception as error:
+            self.log.emit(
+                'Coordinator error: {0}\n{1}'.format(
+                    error, traceback.format_exc()
+                )
+            )
+            self.failed.emit(str(error))
+            return
+        self.finished.emit(result)
 
 
 if __name__ == '__main__':

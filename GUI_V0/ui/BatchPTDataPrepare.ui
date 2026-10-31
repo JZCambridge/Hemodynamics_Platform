@@ -1,0 +1,429 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>BatchPTDataPrepareWindow</class>
+ <widget class="QMainWindow" name="BatchPTDataPrepareWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>980</width>
+    <height>760</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Batch PT Data Prepare</string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QVBoxLayout" name="verticalLayout_BPTDP">
+    <property name="leftMargin">
+     <number>18</number>
+    </property>
+    <property name="topMargin">
+     <number>18</number>
+    </property>
+    <property name="rightMargin">
+     <number>18</number>
+    </property>
+    <property name="bottomMargin">
+     <number>18</number>
+    </property>
+    <item>
+     <widget class="QLabel" name="Title_Label_BPTDP">
+      <property name="font">
+       <font>
+        <pointsize>12</pointsize>
+        <weight>75</weight>
+        <bold>true</bold>
+       </font>
+      </property>
+      <property name="text">
+       <string>Batch PT Data Prepare</string>
+      </property>
+      <property name="alignment">
+       <set>Qt::AlignCenter</set>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="Line" name="line_BPTDP">
+      <property name="orientation">
+       <enum>Qt::Horizontal</enum>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QGroupBox" name="Folders_Group_BPTDP">
+      <property name="title">
+       <string>Input, output, and discovery</string>
+      </property>
+      <layout class="QGridLayout" name="foldersGridLayout_BPTDP">
+       <item row="0" column="0">
+        <widget class="QLabel" name="InputFolder_Label_BPTDP">
+         <property name="text">
+          <string>Input folder</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="1">
+        <widget class="QLineEdit" name="InputFolderPath_Txt_BPTDP">
+         <property name="text">
+          <string>S:\04_JZ\FishAndChips_C2\0_Initial_Segmentation</string>
+         </property>
+         <property name="placeholderText">
+          <string>Batch root, one batch folder, prepared case folders, or flat NIfTI folder</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="2">
+        <widget class="QPushButton" name="ChooseInputFolder_Btn_BPTDP">
+         <property name="text">
+          <string>Browse...</string>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="0">
+        <widget class="QLabel" name="OutputFolder_Label_BPTDP">
+         <property name="text">
+          <string>Output parent folder</string>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="1">
+        <widget class="QLineEdit" name="OutputFolderPath_Txt_BPTDP">
+         <property name="text">
+          <string>S:\04_JZ\FishAndChips_C2</string>
+         </property>
+         <property name="placeholderText">
+          <string>Format-specific Input_Xsection_PT folders will be created here</string>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="2">
+        <widget class="QPushButton" name="ChooseOutputFolder_Btn_BPTDP">
+         <property name="text">
+          <string>Browse...</string>
+         </property>
+        </widget>
+       </item>
+       <item row="2" column="0">
+        <widget class="QLabel" name="Manifest_Label_BPTDP">
+         <property name="text">
+          <string>Compatible manifest (optional)</string>
+         </property>
+        </widget>
+       </item>
+       <item row="2" column="1">
+        <widget class="QLineEdit" name="ManifestPath_Txt_BPTDP">
+         <property name="text">
+          <string>S:\04_JZ\FishAndChips_C2\0_Initial_Segmentation\BatchNIIDataPrepare_manifest.csv</string>
+         </property>
+         <property name="placeholderText">
+          <string>Existing Batch NII manifest, or leave empty for the PT manifest</string>
+         </property>
+        </widget>
+       </item>
+       <item row="2" column="2">
+        <widget class="QPushButton" name="ChooseManifest_Btn_BPTDP">
+         <property name="text">
+          <string>Browse...</string>
+         </property>
+        </widget>
+       </item>
+       <item row="3" column="0">
+        <widget class="QLabel" name="Layout_Label_BPTDP">
+         <property name="text">
+          <string>Input layout</string>
+         </property>
+        </widget>
+       </item>
+       <item row="3" column="1" colspan="2">
+        <widget class="QComboBox" name="Layout_CB_BPTDP">
+         <property name="toolTip">
+          <string>Auto-detect is recommended. Use an override only when the input layout is known.</string>
+         </property>
+         <item>
+          <property name="text">
+           <string>auto - Auto-detect</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string>pipeline - Hymo batches / single batch</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string>prepared - Prepared case folders</string>
+          </property>
+         </item>
+         <item>
+          <property name="text">
+           <string>flat - Flat prepared files</string>
+          </property>
+         </item>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </item>
+    <item>
+     <widget class="QGroupBox" name="Options_Group_BPTDP">
+      <property name="title">
+       <string>Conversion options</string>
+      </property>
+      <layout class="QGridLayout" name="optionsGridLayout_BPTDP">
+       <item row="0" column="0">
+        <widget class="QLabel" name="Arteries_Label_BPTDP">
+         <property name="text">
+          <string>Arteries</string>
+         </property>
+        </widget>
+       </item>
+       <item row="0" column="1">
+        <layout class="QHBoxLayout" name="arteriesLayout_BPTDP">
+         <item>
+          <widget class="QCheckBox" name="RCA_CB_BPTDP">
+           <property name="text">
+            <string>RCA</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QCheckBox" name="LAD_CB_BPTDP">
+           <property name="text">
+            <string>LAD</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QCheckBox" name="LCX_CB_BPTDP">
+           <property name="text">
+            <string>LCX</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="arteriesSpacer_BPTDP">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </item>
+       <item row="1" column="0">
+        <widget class="QLabel" name="Formats_Label_BPTDP">
+         <property name="text">
+          <string>Tensor formats</string>
+         </property>
+        </widget>
+       </item>
+       <item row="1" column="1">
+        <layout class="QHBoxLayout" name="formatsLayout_BPTDP">
+         <item>
+          <widget class="QCheckBox" name="VITFormat_CB_BPTDP">
+           <property name="toolTip">
+            <string>Reference ViT tensor written beneath Input_Xsection_PT</string>
+           </property>
+           <property name="text">
+            <string>Reference ViT: 3 x 224 x 224</string>
+           </property>
+           <property name="checked">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QCheckBox" name="PatchFormat_CB_BPTDP">
+           <property name="toolTip">
+            <string>Patch volume written beneath Input_Xsection_PT_48x48x196</string>
+           </property>
+           <property name="text">
+            <string>Patch volume: 48 x 48 x 196</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="formatsSpacer_BPTDP">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </item>
+       <item row="2" column="0">
+        <widget class="QLabel" name="Workers_Label_BPTDP">
+         <property name="text">
+          <string>Worker threads</string>
+         </property>
+        </widget>
+       </item>
+       <item row="2" column="1">
+        <layout class="QHBoxLayout" name="processingLayout_BPTDP">
+         <item>
+          <widget class="QSpinBox" name="Workers_SB_BPTDP">
+           <property name="toolTip">
+            <string>Maximum number of NIfTI files converted concurrently</string>
+           </property>
+           <property name="minimum">
+            <number>1</number>
+           </property>
+           <property name="maximum">
+            <number>32</number>
+           </property>
+           <property name="value">
+            <number>4</number>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QCheckBox" name="SaveQC_CB_BPTDP">
+           <property name="toolTip">
+            <string>Save lightweight PNG previews under each selected format's _qc folder</string>
+           </property>
+           <property name="text">
+            <string>Save QC previews for up to</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QSpinBox" name="QCCount_SB_BPTDP">
+           <property name="minimum">
+            <number>1</number>
+           </property>
+           <property name="maximum">
+            <number>100</number>
+           </property>
+           <property name="value">
+            <number>3</number>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="QCCount_Label_BPTDP">
+           <property name="text">
+            <string>source files</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="processingSpacer_BPTDP">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </item>
+      </layout>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="OutputInfo_Label_BPTDP">
+      <property name="styleSheet">
+       <string notr="true">color: #555555;</string>
+      </property>
+      <property name="textFormat">
+       <enum>Qt::PlainText</enum>
+      </property>
+      <property name="text">
+       <string>Outputs are bare contiguous float32 tensors named &lt;case_id&gt;_&lt;artery&gt;.pt. Missing selected arteries are recorded and no placeholder tensor is created.</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QPushButton" name="Run_Btn_BPTDP">
+      <property name="minimumSize">
+       <size>
+        <width>0</width>
+        <height>38</height>
+       </size>
+      </property>
+      <property name="text">
+       <string>Prepare PT Data</string>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="Progress_Label_BPTDP">
+      <property name="text">
+       <string>Ready</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QProgressBar" name="Progress_PB_BPTDP">
+      <property name="value">
+       <number>0</number>
+      </property>
+      <property name="format">
+       <string>%p%</string>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="Log_Label_BPTDP">
+      <property name="text">
+       <string>Live conversion log</string>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QPlainTextEdit" name="Log_Txt_BPTDP">
+      <property name="minimumSize">
+       <size>
+        <width>0</width>
+        <height>130</height>
+       </size>
+      </property>
+      <property name="readOnly">
+       <bool>true</bool>
+      </property>
+      <property name="maximumBlockCount">
+       <number>1000</number>
+      </property>
+      <property name="placeholderText">
+       <string>Discovery, progress, validation, and completion messages appear here.</string>
+      </property>
+     </widget>
+    </item>
+   </layout>
+  </widget>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

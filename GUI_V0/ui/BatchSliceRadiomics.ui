@@ -131,7 +131,7 @@
 &lt;html&gt;&lt;head&gt;&lt;meta name=&quot;qrichtext&quot; content=&quot;1&quot; /&gt;&lt;style type=&quot;text/css&quot;&gt;
 p, li { white-space: pre-wrap; }
 &lt;/style&gt;&lt;/head&gt;&lt;body style=&quot; font-family:'SimSun'; font-size:9pt; font-weight:400; font-style:normal;&quot;&gt;
-&lt;p style=&quot; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;&lt;span style=&quot; font-family:'Arial';&quot;&gt;S:/04_JZ/FishAndChips_C2/0_Initial_Segmentation/batch_0&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+&lt;p style=&quot; margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;&lt;span style=&quot; font-family:'Arial';&quot;&gt;S:/04_JZ/FishAndChips_C2/0_Initial_Segmentation&lt;/span&gt;&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
               </property>
              </widget>
             </item>
@@ -218,6 +218,9 @@ p, li { white-space: pre-wrap; }
             </item>
             <item>
              <widget class="QTextBrowser" name="LumenCorrectionPath_Txt_BSRJZ">
+              <property name="toolTip">
+               <string>Lumen-correction process table used by the existing Batch Slice workflow.</string>
+              </property>
               <property name="sizePolicy">
                <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
                 <horstretch>0</horstretch>
@@ -819,7 +822,10 @@ p, li { white-space: pre-wrap; }
                    </size>
                   </property>
                   <property name="text">
-                   <string>Cpus</string>
+                   <string>Max parallel workers</string>
+                  </property>
+                  <property name="toolTip">
+                   <string>Maximum number of batch or case worker processes. Inner processing is limited to one thread per worker.</string>
                   </property>
                   <property name="wordWrap">
                    <bool>true</bool>
@@ -836,6 +842,9 @@ p, li { white-space: pre-wrap; }
                   </property>
                   <property name="text">
                    <string>4</string>
+                  </property>
+                  <property name="toolTip">
+                   <string>Maximum concurrent batch or case workers (default: 4).</string>
                   </property>
                  </widget>
                 </item>
@@ -900,11 +909,14 @@ p, li { white-space: pre-wrap; }
               </item>
               <item>
                <widget class="QCheckBox" name="ScanFile_CB_BSRJZ">
+                <property name="toolTip">
+                 <string>Check only for real, non-empty DICOM images. Leave unchecked for prepared CTA NIfTI input; .dcm marker files do not count.</string>
+                </property>
                 <property name="text">
-                 <string>Scan Files by DCM (NOT chosen use CTA.nii.gz)</string>
+                 <string>Scan input is DICOM (unchecked: prepared CTA NIfTI)</string>
                 </property>
                 <property name="checked">
-                 <bool>true</bool>
+                 <bool>false</bool>
                 </property>
                </widget>
               </item>
@@ -920,11 +932,14 @@ p, li { white-space: pre-wrap; }
               </item>
               <item>
                <widget class="QCheckBox" name="BranchDict_CB_BSRJZ">
+                <property name="toolTip">
+                 <string>Unchecked: reuse an existing coronarySegmentsUse JSON. Check only to regenerate and revalidate artery-use decisions.</string>
+                </property>
                 <property name="text">
                  <string>Generate Artery Dictionary</string>
                 </property>
                 <property name="checked">
-                 <bool>true</bool>
+                 <bool>false</bool>
                 </property>
                </widget>
               </item>
@@ -940,11 +955,14 @@ p, li { white-space: pre-wrap; }
               </item>
               <item>
                <widget class="QCheckBox" name="FM_CB_BSRJZ">
+                <property name="toolTip">
+                 <string>Optional when valid filtered branch masks already exist. Check to validate, adopt, or regenerate them.</string>
+                </property>
                 <property name="text">
-                 <string>Filter Mask (Check when segmentation needed)</string>
+                 <string>Filter Mask (optional for prepared branch masks)</string>
                 </property>
                 <property name="checked">
-                 <bool>true</bool>
+                 <bool>false</bool>
                 </property>
                </widget>
               </item>
@@ -1045,6 +1063,29 @@ p, li { white-space: pre-wrap; }
              </spacer>
             </item>
            </layout>
+          </item>
+          <item>
+           <widget class="QLabel" name="BatchProgress_Label_BSRJZ">
+            <property name="text">
+             <string>Ready</string>
+            </property>
+            <property name="alignment">
+             <set>Qt::AlignCenter</set>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QProgressBar" name="BatchProgress_PB_BSRJZ">
+            <property name="minimum">
+             <number>0</number>
+            </property>
+            <property name="maximum">
+             <number>100</number>
+            </property>
+            <property name="value">
+             <number>0</number>
+            </property>
+           </widget>
           </item>
          </layout>
         </item>

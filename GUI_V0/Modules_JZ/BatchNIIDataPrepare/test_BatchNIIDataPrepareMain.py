@@ -818,6 +818,132 @@ class BatchNIIDataPrepareTests(unittest.TestCase):
                 default_status,
             )
 
+    def test_unknown_manifest_columns_survive_rerun_by_batch_and_case(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            input_path = temporary_path / "input"
+            output_path = temporary_path / "output"
+            input_path.mkdir()
+            write_source(input_path, "CASE_A.nii.gz", b"source-a")
+            write_source(input_path, "CASE_B.nii.gz", b"source-b")
+
+            result = prepare_batch_data(
+                input_path,
+                output_path,
+                create_pipeline_folders=False,
+            )
+            with result.manifest_path.open("r", encoding="utf-8", newline="") as csv_file:
+                reader = csv.DictReader(csv_file)
+                fieldnames = list(reader.fieldnames)
+                rows = list(reader)
+
+            extra_fieldnames = (
+                "pt_reference_complete",
+                "pt_reference_output_path",
+                "review_note",
+            )
+            expected_by_case = {}
+            for row in rows:
+                case_id = row["case_id"]
+                expected_by_case[case_id] = {
+                    "pt_reference_complete": "1",
+                    "pt_reference_output_path": "outputs/{0}.pt".format(case_id),
+                    "review_note": "reviewed-{0}".format(case_id),
+                }
+                row.update(expected_by_case[case_id])
+
+            with result.manifest_path.open("w", encoding="utf-8", newline="") as csv_file:
+                writer = csv.DictWriter(
+                    csv_file,
+                    fieldnames=fieldnames + list(extra_fieldnames),
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                writer.writerows(reversed(rows))
+
+            prepare_batch_data(
+                input_path,
+                output_path,
+                create_pipeline_folders=False,
+            )
+            with result.manifest_path.open("r", encoding="utf-8", newline="") as csv_file:
+                reader = csv.DictReader(csv_file)
+                rerun_fieldnames = reader.fieldnames
+                rerun_rows = {
+                    row["case_id"]: row
+                    for row in reader
+                }
+
+            self.assertEqual(tuple(rerun_fieldnames[-3:]), extra_fieldnames)
+            self.assertEqual(set(rerun_rows), set(expected_by_case))
+            for case_id, expected_values in expected_by_case.items():
+                self.assertEqual(
+                    {
+                        field: rerun_rows[case_id][field]
+                        for field in extra_fieldnames
+                    },
+                    expected_values,
+                )
+
+    def test_unknown_manifest_values_are_not_reused_for_changed_source(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            input_path = temporary_path / "input"
+            output_path = temporary_path / "output"
+            input_path.mkdir()
+            changed_source = write_source(input_path, "CASE_A.nii.gz", b"source-a")
+            write_source(input_path, "CASE_B.nii.gz", b"source-b")
+
+            result = prepare_batch_data(
+                input_path,
+                output_path,
+                create_pipeline_folders=False,
+            )
+            with result.manifest_path.open("r", encoding="utf-8", newline="") as csv_file:
+                reader = csv.DictReader(csv_file)
+                fieldnames = list(reader.fieldnames)
+                rows = list(reader)
+
+            extra_fieldnames = ("pt_run_id", "pt_RCA_state")
+            for row in rows:
+                row["pt_run_id"] = "run-for-{0}".format(row["case_id"])
+                row["pt_RCA_state"] = "complete"
+            with result.manifest_path.open("w", encoding="utf-8", newline="") as csv_file:
+                writer = csv.DictWriter(
+                    csv_file,
+                    fieldnames=fieldnames + list(extra_fieldnames),
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+
+            changed_source.write_bytes(b"changed-source-a")
+            prepare_batch_data(
+                input_path,
+                output_path,
+                create_pipeline_folders=False,
+            )
+            with result.manifest_path.open("r", encoding="utf-8", newline="") as csv_file:
+                reader = csv.DictReader(csv_file)
+                rerun_fieldnames = reader.fieldnames
+                rerun_rows = {
+                    row["case_id"]: row
+                    for row in reader
+                }
+
+            self.assertEqual(tuple(rerun_fieldnames[-2:]), extra_fieldnames)
+            self.assertEqual(
+                {field: rerun_rows["CASE_A"][field] for field in extra_fieldnames},
+                {field: "" for field in extra_fieldnames},
+            )
+            self.assertEqual(
+                {field: rerun_rows["CASE_B"][field] for field in extra_fieldnames},
+                {
+                    "pt_run_id": "run-for-CASE_B",
+                    "pt_RCA_state": "complete",
+                },
+            )
+
     def test_legacy_manifest_gets_defaults_for_new_processing_status_fields(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_path = Path(temporary_directory)

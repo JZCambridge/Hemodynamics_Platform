@@ -72,9 +72,11 @@ RUN /opt/conda/bin/conda create -y -n VTK_Side37 python=3.7 \
 # Install Python packages
 RUN /bin/bash -c "source /opt/conda/bin/activate VTK_Side37 && conda install -c conda-forge libstdcxx-ng gcc \
     && pip install --no-cache-dir \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
     psutil \
     pyside2==5.15.2.1 \
     numpy==1.21.6 \
+    torch==1.13.1+cpu \
     simpleitk==2.0.2 \
     matplotlib==3.4.0 \
     opencv-python-headless==4.5.4.60 \
@@ -106,7 +108,7 @@ exec "$@"' > /entrypoint.sh \
     && chmod +x /entrypoint.sh
 
 # Verification command for Python imports (doesn't require display)
-RUN python -c "import PySide2, vtk, matplotlib, skimage; print('Imports successful')"
+RUN python -c "import PySide2, vtk, matplotlib, skimage, torch; assert torch.version.cuda is None; print('Imports successful')"
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["bash"]

@@ -47,48 +47,45 @@ from PySide2.QtUiTools import QUiLoader
 
 class LumCorrect:
     def __init__(self, UI=None, Hedys=None):
-        self.ui = None
-        if UI:
-            self.ui = UI
-        self.modelui = None
-        if Hedys:
-            self.modelui = Hedys.ui
+        self.ui = UI
+        self.modelui = getattr(Hedys, 'ui', None)
 
-        # load
-        self.ui.chooseCTABtn_LC.clicked.connect(lambda: self.ChooseOpenCTAFile())
-        self.ui.chooseMskBtn_LC.clicked.connect(lambda: self.ChooseOpenMskFile())
-        self.ui.loadBtn_LC.clicked.connect(lambda: self.LoadData())
-        # plot
-        self.ui.plotBtn_LC.clicked.connect(lambda: self.PlotOVerlap())
-        self.ui.quickPlotBtn_LC.clicked.connect(lambda: self.PlotOVerlap())
-        self.ui.plot3DBtn_LC.clicked.connect(lambda: self.VTK3D())
-        self.ui.quickPlot3DBtn_LC.clicked.connect(lambda: self.VTK3D())
-        # segmentation
-        self.ui.initConnectivityBtn_LC.clicked.connect(lambda: self.ConnectivityFilter())
-        self.ui.ImageBasicProcessingBtn_LC.clicked.connect(lambda: self.ImageBasicProcessing())
-        self.ui.Gaussian3DBtn_LC.clicked.connect(lambda: self.Gaussian3D())
-        self.ui.SegmentFilterThresBtn_LC.clicked.connect(lambda: self.SegmentFilterThres())
-        self.ui.FindSlicesBtn_LC.clicked.connect(lambda: self.FindSlicesConnectivity())
-        self.ui.ManualFillBtn_LC.clicked.connect(lambda: self.ManualFill())
-        self.ui.SkinBtn_LC.clicked.connect(lambda: self.Skin())
-        # Update
-        self.ui.updateMaskBtn_LC.clicked.connect(lambda: self.updateSegmentation())
-        self.ui.storeMaskBtn_LC.clicked.connect(lambda: self.intermediateStore())
-        # Image Segmentation
-        self.ui.thresholdBtn_LC.clicked.connect(lambda: self.ThresholdFilter())
-        self.ui.thresholdFilterBtn_LC.clicked.connect(lambda: self.ConnectFilterThres())
-        self.ui.actConBtn_LC.clicked.connect(lambda: self.ActiveContour())
-        self.ui.ACWEBtn_LC.clicked.connect(lambda: self.ACWE())
-        self.ui.ImageSegmentationFilterBtn_LC.clicked.connect(lambda: self.ImageSegmentationFilter())
-        # fill value
-        self.ui.fillValBtn_LC.clicked.connect(lambda: self.OneToValMak())
-        # save
-        self.ui.chooseDirBtn_LC.clicked.connect(lambda: self.ChooseSaveDir())
-        self.ui.saveBtn_LC.clicked.connect(lambda: self.SaveFile())
-        self.ui.clearLogBtn_LC.clicked.connect(lambda: self.ClearLog())
-        # Batch process
-        self.ui.batchTableBtn_LC.clicked.connect(lambda: self.ChooseBatchFile())
-        self.ui.batchProcessBtn_LC.clicked.connect(lambda: self.BatchCorrect())
+        if self.ui is not None:
+            # load
+            self.ui.chooseCTABtn_LC.clicked.connect(lambda: self.ChooseOpenCTAFile())
+            self.ui.chooseMskBtn_LC.clicked.connect(lambda: self.ChooseOpenMskFile())
+            self.ui.loadBtn_LC.clicked.connect(lambda: self.LoadData())
+            # plot
+            self.ui.plotBtn_LC.clicked.connect(lambda: self.PlotOVerlap())
+            self.ui.quickPlotBtn_LC.clicked.connect(lambda: self.PlotOVerlap())
+            self.ui.plot3DBtn_LC.clicked.connect(lambda: self.VTK3D())
+            self.ui.quickPlot3DBtn_LC.clicked.connect(lambda: self.VTK3D())
+            # segmentation
+            self.ui.initConnectivityBtn_LC.clicked.connect(lambda: self.ConnectivityFilter())
+            self.ui.ImageBasicProcessingBtn_LC.clicked.connect(lambda: self.ImageBasicProcessing())
+            self.ui.Gaussian3DBtn_LC.clicked.connect(lambda: self.Gaussian3D())
+            self.ui.SegmentFilterThresBtn_LC.clicked.connect(lambda: self.SegmentFilterThres())
+            self.ui.FindSlicesBtn_LC.clicked.connect(lambda: self.FindSlicesConnectivity())
+            self.ui.ManualFillBtn_LC.clicked.connect(lambda: self.ManualFill())
+            self.ui.SkinBtn_LC.clicked.connect(lambda: self.Skin())
+            # Update
+            self.ui.updateMaskBtn_LC.clicked.connect(lambda: self.updateSegmentation())
+            self.ui.storeMaskBtn_LC.clicked.connect(lambda: self.intermediateStore())
+            # Image Segmentation
+            self.ui.thresholdBtn_LC.clicked.connect(lambda: self.ThresholdFilter())
+            self.ui.thresholdFilterBtn_LC.clicked.connect(lambda: self.ConnectFilterThres())
+            self.ui.actConBtn_LC.clicked.connect(lambda: self.ActiveContour())
+            self.ui.ACWEBtn_LC.clicked.connect(lambda: self.ACWE())
+            self.ui.ImageSegmentationFilterBtn_LC.clicked.connect(lambda: self.ImageSegmentationFilter())
+            # fill value
+            self.ui.fillValBtn_LC.clicked.connect(lambda: self.OneToValMak())
+            # save
+            self.ui.chooseDirBtn_LC.clicked.connect(lambda: self.ChooseSaveDir())
+            self.ui.saveBtn_LC.clicked.connect(lambda: self.SaveFile())
+            self.ui.clearLogBtn_LC.clicked.connect(lambda: self.ClearLog())
+            # Batch process
+            self.ui.batchTableBtn_LC.clicked.connect(lambda: self.ChooseBatchFile())
+            self.ui.batchProcessBtn_LC.clicked.connect(lambda: self.BatchCorrect())
             
         self.InitProcess()
 
@@ -1635,8 +1632,8 @@ class LumCorrect:
                + "\n############################\n"
 
         # update log and display message
-        if self.modelui:
+        if self.modelui is not None:
             self.modelui.plainTextEdit_Message.setPlainText(disp)
             self.modelui.plainTextEdit_Log.appendPlainText(disp)
-            self.outLog += disp
+        self.outLog += disp
         print(disp)

@@ -32,20 +32,17 @@ from PySide2.QtUiTools import QUiLoader
 
 class FilterMask:
     def __init__(self, UI = None,Hedys = None):
-        self.ui = None
-        if UI:
-            self.ui = UI
-        self.modelui = None
-        if Hedys:
-            self.modelui = Hedys.ui
+        self.ui = UI
+        self.modelui = getattr(Hedys, 'ui', None)
 
-        self.ui.chooseFileBtn_FM.clicked.connect(lambda: self.ChooseOpenFile())
-        self.ui.loadFileBtn_FM.clicked.connect(lambda: self.LoadImage())
-        self.ui.filterBtn_FM.clicked.connect(lambda: self.FilterValues())
-        self.ui.chooseSaveBtn_FM.clicked.connect(lambda: self.ChooseSaveDir())
-        self.ui.saveBtn_FM.clicked.connect(lambda: self.SaveFile())
-        self.ui.ChooseBatchCsvBtn_FM.clicked.connect(lambda: self.ChooseCsvFile())
-        self.ui.BatchProcessingBtn_FM.clicked.connect(lambda: self.BatchProcessing())
+        if self.ui is not None:
+            self.ui.chooseFileBtn_FM.clicked.connect(lambda: self.ChooseOpenFile())
+            self.ui.loadFileBtn_FM.clicked.connect(lambda: self.LoadImage())
+            self.ui.filterBtn_FM.clicked.connect(lambda: self.FilterValues())
+            self.ui.chooseSaveBtn_FM.clicked.connect(lambda: self.ChooseSaveDir())
+            self.ui.saveBtn_FM.clicked.connect(lambda: self.SaveFile())
+            self.ui.ChooseBatchCsvBtn_FM.clicked.connect(lambda: self.ChooseCsvFile())
+            self.ui.BatchProcessingBtn_FM.clicked.connect(lambda: self.BatchProcessing())
         
         self.InitFilterMask()
         
