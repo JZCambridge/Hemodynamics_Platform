@@ -329,12 +329,14 @@ def _coerce_config(config):
     else:
         raise TypeError("config must be PTPrepareConfig or a dictionary")
 
-    input_folder = str(Path(result.input_folder).expanduser())
-    output_parent = str(Path(result.output_parent).expanduser())
-    if not input_folder.strip():
+    raw_input_folder = str(result.input_folder or "").strip()
+    raw_output_parent = str(result.output_parent or "").strip()
+    if not raw_input_folder:
         raise ValueError("Input folder is required.")
-    if not output_parent.strip():
+    if not raw_output_parent:
         raise ValueError("Output parent folder is required.")
+    input_folder = str(Path(raw_input_folder).expanduser())
+    output_parent = str(Path(raw_output_parent).expanduser())
     selected_arteries = _normalise_arteries(result.selected_arteries)
     layout = _normalise_layout(result.layout)
     max_workers = max(1, int(result.max_workers))
@@ -1052,6 +1054,18 @@ def _signature_matches_row(row, record, signature):
     prefix = "pt_{0}_".format(record.artery.casefold())
     size = _integer_cell(row, prefix + "source_size_bytes")
     mtime = _integer_cell(row, prefix + "source_mtime_ns")
+    recorded_path = str(
+        row.get(prefix + "source_path", "")
+    ).strip()
+    if recorded_path:
+        normalised_recorded = os.path.normcase(
+            os.path.abspath(os.path.expanduser(recorded_path))
+        )
+        normalised_current = os.path.normcase(
+            os.path.abspath(os.path.expanduser(record.source_path))
+        )
+        if normalised_recorded != normalised_current:
+            return False
     return size == signature[0] and mtime == signature[1]
 
 
@@ -1255,6 +1269,26 @@ def _process_record(
         signature_after = _source_signature(source_path)
     except Exception as error:
         message = _clean_error(error)
+        try:
+            signature_after = _source_signature(source_path)
+        except Exception:
+            signature_after = signature_before
+        if signature_after != signature_before:
+            message = (
+                "Source changed while the NIfTI read failed; retry later. "
+                + message
+            )
+            return PTSourceOutcome(
+                record=record,
+                source_size_bytes=signature_after[0],
+                source_mtime_ns=signature_after[1],
+                source_state="deferred",
+                sampling=None,
+                format_outcomes=_deferred_outcomes(
+                    config, record, message
+                ),
+                error=message,
+            )
         return PTSourceOutcome(
             record=record,
             source_size_bytes=signature_before[0],
