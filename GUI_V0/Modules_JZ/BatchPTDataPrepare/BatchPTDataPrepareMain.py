@@ -27,7 +27,7 @@ import tempfile
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -37,7 +37,7 @@ import SimpleITK as sitk
 
 try:
     from PySide2.QtCore import QObject, QThread, Signal, Slot
-    from PySide2.QtWidgets import QFileDialog, QMessageBox
+    from PySide2.QtWidgets import QApplication, QFileDialog, QMessageBox
     QT_AVAILABLE = True
 except ImportError:
     QT_AVAILABLE = False
@@ -72,6 +72,7 @@ except ImportError:
 
     QFileDialog = None
     QMessageBox = None
+    QApplication = None
 
 
 DEFAULT_INPUT_FOLDER = (
@@ -91,6 +92,8 @@ LAYOUTS = ("auto", "pipeline", "prepared", "flat")
 DEFAULT_WORKERS = 4
 DEFAULT_QC_COUNT = 3
 DEFAULT_CHECKPOINT_CASES = 25
+PROGRESS_HEARTBEAT_SECONDS = 1.0
+CONSOLE_PROGRESS_HEARTBEAT_SECONDS = 10.0
 LOCK_TIMEOUT_SECONDS = 120
 LOCK_POLL_SECONDS = 0.1
 MAX_ERROR_LENGTH = 4000
@@ -303,13 +306,16 @@ class PTRunResult:
     fallback_manifest_path: str
     log_path: str
     duration_seconds: float
+    cancelled: bool = False
 
     def summary(self):
+        state = "cancelled" if self.cancelled else "finished"
         return (
-            "PT preparation finished: {0} sources across {1} cases; "
-            "saved {2}, skipped {3}, missing {4}, deferred {5}, failed {6}; "
-            "elapsed {7:.1f}s."
+            "PT preparation {0}: {1} sources across {2} cases; "
+            "saved {3}, skipped {4}, missing {5}, deferred {6}, failed {7}; "
+            "elapsed {8:.1f}s."
         ).format(
+            state,
             self.source_count,
             self.case_count,
             self.saved_count,
@@ -509,7 +515,10 @@ def _discover_all_inputs(config):
             except ValueError as error:
                 discovery_errors[layout] = error
                 records = []
-            if records:
+            layout_present = bool(records)
+            if layout == "pipeline" and not layout_present:
+                layout_present = bool(_pipeline_case_locations(root))
+            if layout_present:
                 candidates[layout] = records
         if len(candidates) > 1:
             raise ValueError(
@@ -529,7 +538,10 @@ def _discover_all_inputs(config):
     else:
         layout = config.layout
         records = discoverers[layout](root)
-        if not records:
+        layout_present = bool(records)
+        if layout == "pipeline" and not layout_present:
+            layout_present = bool(_pipeline_case_locations(root))
+        if not layout_present:
             raise ValueError(
                 "No {0} layout cross-sectional CTA NIfTIs were found under "
                 "{1}.".format(layout, root)
@@ -579,9 +591,11 @@ def _array_to_vit_tensor(array_zyx):
                 array_zyx.shape
             )
         )
-    image_xyz = np.asarray(
-        np.transpose(array_zyx, (2, 1, 0)), dtype=np.float32, order="C"
-    )
+    # Keep the x-y-z transpose as a view and cast only the sampled centre
+    # strip.  Real CTALI volumes are often 256x256 with thousands of slices;
+    # copying the full volume to float32 would waste hundreds of megabytes per
+    # worker even though the reference transform uses only 16x16 pixels.
+    image_xyz = np.transpose(array_zyx, (2, 1, 0))
     size_x, size_y, _size_z = image_xyz.shape
     if size_x < 16 or size_y < 16:
         raise ValueError(
@@ -591,11 +605,15 @@ def _array_to_vit_tensor(array_zyx):
         )
     start_x = size_x // 2 - 8
     start_y = size_y // 2 - 8
-    sampled = image_xyz[
-        start_x:start_x + 16,
-        start_y:start_y + 16,
-        ::5,
-    ]
+    sampled = np.asarray(
+        image_xyz[
+            start_x:start_x + 16,
+            start_y:start_y + 16,
+            ::5,
+        ],
+        dtype=np.float32,
+        order="C",
+    )
     tiles = np.transpose(sampled, (2, 0, 1))
     sampled_count = int(tiles.shape[0])
     used_count = min(sampled_count, 196)
@@ -623,7 +641,9 @@ def _array_to_vit_tensor(array_zyx):
 
 def _read_nifti_to_vit(path):
     image = sitk.ReadImage(str(path))
-    array_zyx = sitk.GetArrayFromImage(image)
+    # A read-only view avoids duplicating the full CTALI volume in memory;
+    # _array_to_vit_tensor copies only the small sampled centre strip.
+    array_zyx = sitk.GetArrayViewFromImage(image)
     return _array_to_vit_tensor(array_zyx)
 
 
@@ -782,7 +802,18 @@ def _atomic_save_tensor(tensor, destination, format_name):
 
 def _flush_and_sync(file_object):
     file_object.flush()
-    os.fsync(file_object.fileno())
+    try:
+        os.fsync(file_object.fileno())
+    except OSError as error:
+        if (
+                os.name != "nt"
+                or error.errno != errno.EBADF
+                or file_object.closed):
+            raise
+        try:
+            os.fstat(file_object.fileno())
+        except OSError:
+            raise error
 
 
 @contextmanager
@@ -895,7 +926,12 @@ def _find_manifest_row(rows, update):
     if len(exact) == 1:
         return exact[0]
     if len(same_case) == 1:
-        return same_case[0]
+        candidate = same_case[0]
+        candidate_batch = str(
+            candidate.get("batch_name", "")
+        ).strip().casefold()
+        if not batch_key or not candidate_batch:
+            return candidate
     return None
 
 
@@ -988,7 +1024,11 @@ def merge_pt_manifest_updates(manifest_path, fallback_path, updates):
 def _manifest_candidates(path):
     if not path:
         return []
-    _fields, rows = _read_csv_rows(path)
+    path = Path(path)
+    if not path.is_file():
+        return []
+    with interprocess_file_lock(str(path) + ".lock"):
+        _fields, rows = _read_csv_rows(path)
     return rows
 
 
@@ -1074,24 +1114,23 @@ def _can_skip_output(
     destination = Path(destination)
     if not destination.is_file():
         return False
-    row_has_signature = False
-    if previous_row is not None:
-        prefix = "pt_{0}_".format(record.artery.casefold())
-        row_has_signature = (
-            _integer_cell(
-                previous_row, prefix + "source_size_bytes"
-            ) is not None
-            or _integer_cell(
-                previous_row, prefix + "source_mtime_ns"
-            ) is not None
-        )
-    if row_has_signature:
-        unchanged = _signature_matches_row(
-            previous_row, record, signature
-        )
-    else:
-        unchanged = destination.stat().st_mtime_ns >= signature[1]
-    return unchanged and validate_pt_output(destination, format_name)
+    if previous_row is None:
+        return False
+    prefix = "pt_{0}_".format(record.artery.casefold())
+    row_has_signature = (
+        _integer_cell(
+            previous_row, prefix + "source_size_bytes"
+        ) is not None
+        and _integer_cell(
+            previous_row, prefix + "source_mtime_ns"
+        ) is not None
+    )
+    if not row_has_signature:
+        return False
+    return (
+        _signature_matches_row(previous_row, record, signature)
+        and validate_pt_output(destination, format_name)
+    )
 
 
 def _scale_preview(array):
@@ -1420,8 +1459,39 @@ def _software_versions():
     )
 
 
-def _case_inventory(records):
+def _pipeline_case_seeds(config, layout):
+    if layout != "pipeline":
+        return ()
+    root = Path(config.input_folder)
+    seeds = []
+    for case_path, batch_name in _pipeline_case_locations(root):
+        try:
+            relative_path = str(case_path.relative_to(root))
+        except ValueError:
+            relative_path = case_path.name
+        seeds.append({
+            "case_id": case_path.name,
+            "batch_name": batch_name,
+            "case_relative_path": relative_path,
+        })
+    return tuple(seeds)
+
+
+def _case_inventory(records, case_seeds=()):
     inventory = {}
+    for seed in case_seeds:
+        case_id = str(seed["case_id"])
+        batch_name = str(seed.get("batch_name", ""))
+        inventory[
+            (batch_name.casefold(), case_id.casefold())
+        ] = {
+            "case_id": case_id,
+            "batch_name": batch_name,
+            "case_relative_path": str(
+                seed.get("case_relative_path", "")
+            ),
+            "records": {},
+        }
     for record in records:
         case = inventory.setdefault(
             record.case_key,
@@ -1533,6 +1603,11 @@ def _case_manifest_update(
             update[artery_prefix + "truncated_count"] = (
                 outcome.sampling.truncated_count
             )
+        else:
+            update[artery_prefix + "sampled_count"] = ""
+            update[artery_prefix + "used_count"] = ""
+            update[artery_prefix + "padded_count"] = ""
+            update[artery_prefix + "truncated_count"] = ""
         for format_outcome in outcome.format_outcomes:
             _format_outcome_fields(
                 update, artery, format_outcome
@@ -1603,7 +1678,10 @@ def _safe_callback(callback, value):
 
 
 def run_pt_preparation(
-        config, progress_callback=None, log_callback=None):
+        config,
+        progress_callback=None,
+        log_callback=None,
+        cancel_event=None):
     """Discover, convert, validate, checkpoint, and return one run result."""
 
     config = _coerce_config(config)
@@ -1638,7 +1716,10 @@ def run_pt_preparation(
             record for record in all_records
             if record.artery in selected_set
         )
-        cases = _case_inventory(all_records)
+        cases = _case_inventory(
+            all_records,
+            _pipeline_case_seeds(config, layout),
+        )
         worker_count = min(
             config.max_workers,
             max(1, len(records)),
@@ -1682,6 +1763,24 @@ def run_pt_preparation(
         completed_sources = 0
         previous_percent = 0
         last_checkpoint_count = 0
+        cancelled = False
+        cancellation_logged = False
+
+        def cancellation_requested():
+            return (
+                cancel_event is not None
+                and cancel_event.is_set()
+            )
+
+        def note_cancellation():
+            nonlocal cancelled, cancellation_logged
+            cancelled = True
+            if not cancellation_logged:
+                emit_log(
+                    "Cancellation requested; waiting for active source "
+                    "conversions to finish."
+                )
+                cancellation_logged = True
 
         emit_log(
             "Run {0}: layout={1}, cases={2}, sources={3}, workers={4}, "
@@ -1786,63 +1885,96 @@ def run_pt_preparation(
             with ThreadPoolExecutor(
                     max_workers=worker_count,
                     thread_name_prefix="BatchPT") as executor:
-                futures = {
-                    executor.submit(
-                        _process_record,
-                        record,
-                        config,
-                        previous_rows.get(record.key),
-                        record.key in qc_keys,
-                    ): record
-                    for record in records
-                }
-                for future in as_completed(futures):
-                    record = futures[future]
+                record_iterator = iter(records)
+                futures = {}
+
+                def submit_next_record():
+                    if cancellation_requested():
+                        note_cancellation()
+                        return False
                     try:
-                        outcome = future.result()
-                    except BaseException as error:
-                        message = _clean_error(
-                            "{0}: {1}".format(
-                                type(error).__name__, error
+                        next_record = next(record_iterator)
+                    except StopIteration:
+                        return False
+                    future = executor.submit(
+                        _process_record,
+                        next_record,
+                        config,
+                        previous_rows.get(next_record.key),
+                        next_record.key in qc_keys,
+                    )
+                    futures[future] = next_record
+                    return True
+
+                for _index in range(worker_count):
+                    if not submit_next_record():
+                        break
+
+                while futures:
+                    if cancellation_requested():
+                        note_cancellation()
+                    completed_futures, _pending_futures = wait(
+                        tuple(futures),
+                        timeout=PROGRESS_HEARTBEAT_SECONDS,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not completed_futures:
+                        progress_snapshot(
+                            sum(
+                                1 for future in futures
+                                if not future.done()
                             )
                         )
-                        outcome = PTSourceOutcome(
-                            record=record,
-                            source_size_bytes=0,
-                            source_mtime_ns=0,
-                            source_state="failed",
-                            sampling=None,
-                            format_outcomes=_failed_outcomes(
-                                config, record, message
-                            ),
-                            error=message,
+                        continue
+                    for future in completed_futures:
+                        record = futures.pop(future)
+                        try:
+                            outcome = future.result()
+                        except BaseException as error:
+                            message = _clean_error(
+                                "{0}: {1}".format(
+                                    type(error).__name__, error
+                                )
+                            )
+                            outcome = PTSourceOutcome(
+                                record=record,
+                                source_size_bytes=0,
+                                source_mtime_ns=0,
+                                source_state="failed",
+                                sampling=None,
+                                format_outcomes=_failed_outcomes(
+                                    config, record, message
+                                ),
+                                error=message,
+                            )
+                        source_outcomes.append(outcome)
+                        outcomes_by_key[record.key] = outcome
+                        completed_sources += 1
+                        for format_outcome in outcome.format_outcomes:
+                            if format_outcome.state == "saved":
+                                saved_count += 1
+                            elif format_outcome.state == "skipped":
+                                skipped_count += 1
+                            elif format_outcome.state == "failed":
+                                failed_count += 1
+                            elif format_outcome.state == "deferred":
+                                deferred_count += 1
+                        pending_by_case[record.case_key] -= 1
+                        if pending_by_case[record.case_key] == 0:
+                            completed_case_keys.add(record.case_key)
+                        line = _source_result_line(outcome)
+                        emit_log(line)
+                        submit_next_record()
+                        active = min(
+                            worker_count,
+                            len(records) - completed_sources,
                         )
-                    source_outcomes.append(outcome)
-                    outcomes_by_key[record.key] = outcome
-                    completed_sources += 1
-                    for format_outcome in outcome.format_outcomes:
-                        if format_outcome.state == "saved":
-                            saved_count += 1
-                        elif format_outcome.state == "skipped":
-                            skipped_count += 1
-                        elif format_outcome.state == "failed":
-                            failed_count += 1
-                        elif format_outcome.state == "deferred":
-                            deferred_count += 1
-                    pending_by_case[record.case_key] -= 1
-                    if pending_by_case[record.case_key] == 0:
-                        completed_case_keys.add(record.case_key)
-                    line = _source_result_line(outcome)
-                    emit_log(line)
-                    active = min(
-                        worker_count,
-                        len(records) - completed_sources,
-                    )
-                    progress_snapshot(active)
-                    checkpoint(force=False)
+                        progress_snapshot(active)
+                        checkpoint(force=False)
 
         checkpoint(force=True)
-        progress_snapshot(0, force_complete=True)
+        cancelled = cancelled and completed_sources < len(records)
+        progress_snapshot(0, force_complete=not cancelled)
         source_outcomes.sort(
             key=lambda item: (
                 _natural_key(item.record.batch_name),
@@ -1867,6 +1999,7 @@ def run_pt_preparation(
             fallback_manifest_path=config.fallback_manifest_path,
             log_path=str(log_path),
             duration_seconds=duration,
+            cancelled=cancelled,
         )
         emit_log(result.summary())
         return result
@@ -1889,9 +2022,10 @@ class PTPreparationCoordinator(QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, config):
+    def __init__(self, config, cancel_event=None):
         super().__init__()
         self.config = config
+        self.cancel_event = cancel_event
 
     @Slot()
     def run(self):
@@ -1900,6 +2034,7 @@ class PTPreparationCoordinator(QObject):
                 self.config,
                 progress_callback=self.progress.emit,
                 log_callback=self.log.emit,
+                cancel_event=self.cancel_event,
             )
         except Exception as error:
             self.log.emit(
@@ -1963,7 +2098,10 @@ class BatchPTDataPrepare(QObject):
         self.modelui = Hedys.ui if Hedys is not None else None
         self._run_thread = None
         self._run_coordinator = None
+        self._cancel_event = None
+        self._shutting_down = False
         self._last_run_result = None
+        self._reset_console_progress()
         if self.ui is not None:
             self._connect_button(
                 "ChooseInputFolder_Btn_BPTDP",
@@ -1989,6 +2127,12 @@ class BatchPTDataPrepare(QObject):
                 self.modelui.QStackedWidget_Module.setCurrentWidget(
                     self.ui.centralwidget
                 )
+            application = (
+                QApplication.instance()
+                if QApplication is not None else None
+            )
+            if application is not None:
+                application.aboutToQuit.connect(self.shutdown)
 
     def _connect_button(self, name, callback):
         button = getattr(self.ui, name, None)
@@ -2125,10 +2269,34 @@ class BatchPTDataPrepare(QObject):
             config = self._config_from_ui()
         return run_pt_preparation(config)
 
+    def _reset_console_progress(self):
+        self._console_progress_seen = False
+        self._console_last_completed_sources = None
+        self._console_last_progress_printed_at = None
+        self._console_final_progress_printed = False
+
+    @staticmethod
+    def _print_console(kind, message):
+        stream = sys.stdout
+        if stream is None:
+            return
+        try:
+            print(
+                "[{0}] Batch PT {1} | {2}".format(
+                    _utc_now(), kind, str(message)
+                ),
+                file=stream,
+                flush=True,
+            )
+        except (OSError, ValueError):
+            pass
+
     @Slot()
     def startRun(self):
         if not QT_AVAILABLE:
             raise RuntimeError("PySide2 is required for the GUI controller.")
+        if self._shutting_down:
+            return
         if (
                 self._run_thread is not None
                 and self._run_thread.isRunning()):
@@ -2138,10 +2306,35 @@ class BatchPTDataPrepare(QObject):
         except Exception as error:
             self._on_failed(str(error))
             return
+        self._reset_console_progress()
+        self._print_console(
+            "config",
+            "input={0!r} | output={1!r} | manifest={2!r} | "
+            "layout={3} | arteries={4} | formats={5} | workers={6} | "
+            "QC={7}".format(
+                config.input_folder,
+                config.output_parent,
+                (
+                    config.manifest_path
+                    or config.fallback_manifest_path
+                ),
+                config.layout,
+                ",".join(config.selected_arteries),
+                ",".join(config.selected_formats),
+                config.max_workers,
+                (
+                    "on({0})".format(config.qc_count)
+                    if config.save_qc else "off"
+                ),
+            ),
+        )
         self._set_run_enabled(False)
         self._set_progress("Discovering inputs...", 0)
         thread = QThread()
-        coordinator = PTPreparationCoordinator(config)
+        cancel_event = threading.Event()
+        coordinator = PTPreparationCoordinator(
+            config, cancel_event=cancel_event
+        )
         coordinator.moveToThread(thread)
         thread.started.connect(coordinator.run)
         coordinator.progress.connect(self._on_progress)
@@ -2156,9 +2349,40 @@ class BatchPTDataPrepare(QObject):
         thread.finished.connect(thread.deleteLater)
         self._run_thread = thread
         self._run_coordinator = coordinator
+        self._cancel_event = cancel_event
         thread.start()
 
     startPreparation = startRun
+
+    @Slot()
+    def shutdown(self, wait_milliseconds=None):
+        """Cooperatively stop scheduling work and wait for a safe exit."""
+
+        self._shutting_down = True
+        self._set_run_enabled(False)
+        if self._cancel_event is not None:
+            self._cancel_event.set()
+        thread = self._run_thread
+        if thread is None:
+            return True
+        try:
+            thread.requestInterruption()
+            thread.quit()
+            if QThread.currentThread() is thread:
+                return False
+            if wait_milliseconds is None:
+                finished = thread.wait()
+            else:
+                finished = thread.wait(
+                    max(0, int(wait_milliseconds))
+                )
+        except RuntimeError:
+            finished = True
+        if finished and self._run_thread is thread:
+            self._run_thread = None
+            self._run_coordinator = None
+            self._cancel_event = None
+        return bool(finished)
 
     def _set_run_enabled(self, enabled):
         if self.ui is None:
@@ -2225,9 +2449,44 @@ class BatchPTDataPrepare(QObject):
             self._duration(snapshot.eta_seconds),
         )
         self._set_progress(status, snapshot.percent)
+        now = time.monotonic()
+        initial = not self._console_progress_seen
+        source_count_changed = (
+            self._console_last_completed_sources is not None
+            and snapshot.completed_source_files
+            != self._console_last_completed_sources
+        )
+        heartbeat_due = (
+            self._console_last_progress_printed_at is not None
+            and now - self._console_last_progress_printed_at
+            >= CONSOLE_PROGRESS_HEARTBEAT_SECONDS
+        )
+        final = snapshot.active_workers == 0
+        should_print = (
+            not self._console_final_progress_printed
+            and (
+                initial
+                or source_count_changed
+                or heartbeat_due
+                or final
+            )
+        )
+        self._console_progress_seen = True
+        self._console_last_completed_sources = (
+            snapshot.completed_source_files
+        )
+        if should_print:
+            self._print_console(
+                "progress",
+                "{0} | {1}%".format(status, snapshot.percent),
+            )
+            self._console_last_progress_printed_at = now
+            if final:
+                self._console_final_progress_printed = True
 
     @Slot(str)
     def _append_log(self, message):
+        self._print_console("log", message)
         if self.ui is not None:
             widget = getattr(self.ui, "Log_Txt_BPTDP", None)
             if widget is not None:
@@ -2250,15 +2509,14 @@ class BatchPTDataPrepare(QObject):
     @Slot(object)
     def _on_finished(self, result):
         self._last_run_result = result
-        self._append_log(result.summary())
-        self._set_progress(result.summary(), 100)
+        percent = None if result.cancelled else 100
+        self._set_progress(result.summary(), percent)
 
     @Slot(str)
     def _on_failed(self, message):
         message = str(message)
         self._append_log("PT preparation failed: " + message)
         self._set_progress("Failed: " + message, 0)
-        self._set_run_enabled(True)
         if (
                 QMessageBox is not None
                 and self.ui is not None
@@ -2271,7 +2529,9 @@ class BatchPTDataPrepare(QObject):
     def _on_thread_finished(self):
         self._run_thread = None
         self._run_coordinator = None
-        self._set_run_enabled(True)
+        self._cancel_event = None
+        if not self._shutting_down:
+            self._set_run_enabled(True)
 
 
 def _build_cli_parser():
@@ -2333,29 +2593,59 @@ def main(argv=None):
         save_qc=arguments.save_qc,
         qc_count=arguments.qc_count,
     )
+    last_cli_progress = {
+        "completed_sources": -1,
+        "printed_at": 0.0,
+    }
+
+    def print_cli_progress(snapshot):
+        now = time.monotonic()
+        source_advanced = (
+            snapshot.completed_source_files
+            != last_cli_progress["completed_sources"]
+        )
+        heartbeat_due = now - last_cli_progress["printed_at"] >= 10.0
+        if not source_advanced and snapshot.percent < 100 and not heartbeat_due:
+            return
+        print(
+            "{0:3d}% files {1}/{2}, cases {3}/{4}, saved {5}, "
+            "skipped {6}, missing {7}, deferred {8}, failed {9}, "
+            "active {10}, elapsed {11:.1f}s, ETA {12:.1f}s".format(
+                snapshot.percent,
+                snapshot.completed_source_files,
+                snapshot.total_source_files,
+                snapshot.completed_cases,
+                snapshot.total_cases,
+                snapshot.saved_outputs,
+                snapshot.skipped_outputs,
+                snapshot.missing_outputs,
+                snapshot.deferred_outputs,
+                snapshot.failed_outputs,
+                snapshot.active_workers,
+                snapshot.elapsed_seconds,
+                snapshot.eta_seconds,
+            ),
+            flush=True,
+        )
+        last_cli_progress["completed_sources"] = (
+            snapshot.completed_source_files
+        )
+        last_cli_progress["printed_at"] = now
+
     try:
         result = run_pt_preparation(
             config,
-            progress_callback=lambda snapshot: print(
-                "{0:3d}% files {1}/{2}, cases {3}/{4}, "
-                "saved {5}, skipped {6}, failed {7}".format(
-                    snapshot.percent,
-                    snapshot.completed_source_files,
-                    snapshot.total_source_files,
-                    snapshot.completed_cases,
-                    snapshot.total_cases,
-                    snapshot.saved_outputs,
-                    snapshot.skipped_outputs,
-                    snapshot.failed_outputs,
-                )
-            ),
+            progress_callback=print_cli_progress,
             log_callback=print,
         )
     except Exception as error:
         print("Batch PT Data Prepare failed: {0}".format(error), file=sys.stderr)
         return 1
-    print(result.summary())
-    return 0 if result.failed_count == 0 else 2
+    return 0 if (
+        result.failed_count == 0
+        and result.deferred_count == 0
+        and not result.cancelled
+    ) else 2
 
 
 if __name__ == "__main__":

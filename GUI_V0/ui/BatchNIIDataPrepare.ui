@@ -91,7 +91,7 @@
        <item row="1" column="1">
         <widget class="QLineEdit" name="OutputFolderPath_Txt_BNDP">
          <property name="text">
-          <string>S:\04_JZ\FishAndChips_C2</string>
+          <string>S:\04_JZ\FishAndChips_C2_round2</string>
          </property>
          <property name="placeholderText">
           <string>0_Initial_Segmentation will be created here</string>
@@ -128,6 +128,61 @@
          </property>
         </widget>
        </item>
+       <item row="3" column="0">
+        <widget class="QCheckBox" name="LimitCases_CB_BNDP">
+         <property name="toolTip">
+          <string>Checked: prepare only the first N deterministically sorted cases. Unchecked: prepare all cases.</string>
+         </property>
+         <property name="text">
+          <string>Limit to first N cases</string>
+         </property>
+         <property name="checked">
+          <bool>true</bool>
+         </property>
+        </widget>
+       </item>
+       <item row="3" column="1">
+        <widget class="QSpinBox" name="CaseLimit_SB_BNDP">
+         <property name="toolTip">
+          <string>Number of cases to prepare after deterministic filename sorting. Uncheck Limit to first N cases to prepare all cases.</string>
+         </property>
+         <property name="minimum">
+          <number>1</number>
+         </property>
+         <property name="maximum">
+          <number>2147483647</number>
+         </property>
+         <property name="value">
+          <number>30</number>
+         </property>
+        </widget>
+       </item>
+       <item row="4" column="0">
+        <widget class="QLabel" name="ParallelWorkers_Label_BNDP">
+         <property name="text">
+          <string>Parallel preparation</string>
+         </property>
+        </widget>
+       </item>
+       <item row="4" column="1">
+        <widget class="QSpinBox" name="ParallelWorkers_SB_BNDP">
+         <property name="toolTip">
+          <string>Worker threads run independent NIfTI cases concurrently. Two workers are recommended for the single mechanical S: drive; 4-8 workers may be slower because copying and checksums compete for the same disk.</string>
+         </property>
+         <property name="suffix">
+          <string> workers</string>
+         </property>
+         <property name="minimum">
+          <number>1</number>
+         </property>
+         <property name="maximum">
+          <number>8</number>
+         </property>
+         <property name="value">
+          <number>2</number>
+         </property>
+        </widget>
+       </item>
       </layout>
      </widget>
     </item>
@@ -135,6 +190,19 @@
      <widget class="QCheckBox" name="CreateFolders_CB_BNDP">
       <property name="text">
        <string>Create full BatchCoronary folder structure</string>
+      </property>
+      <property name="checked">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QCheckBox" name="NormalizeForSegmentation_CB_BNDP">
+      <property name="toolTip">
+       <string>Losslessly permutes/flips axes to LPS and bakes integral HU values into signed int16. No spatial interpolation or resampling is performed.</string>
+      </property>
+      <property name="text">
+       <string>Normalize CTA to LPS int16 for segmentation (recommended)</string>
       </property>
       <property name="checked">
        <bool>true</bool>
@@ -226,6 +294,32 @@
       </property>
       <property name="text">
        <string>Prepare Batch NII Data</string>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QLabel" name="Progress_Label_BNDP">
+      <property name="text">
+       <string>Processed 0/0 | passed 0 | changed 0 | unchanged 0 | failed 0 | excluded 0</string>
+      </property>
+      <property name="wordWrap">
+       <bool>true</bool>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QProgressBar" name="ProgressBar_BNDP">
+      <property name="minimum">
+       <number>0</number>
+      </property>
+      <property name="maximum">
+       <number>1</number>
+      </property>
+      <property name="value">
+       <number>0</number>
+      </property>
+      <property name="format">
+       <string>%v/%m cases (%p%)</string>
       </property>
      </widget>
     </item>
